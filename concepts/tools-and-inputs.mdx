@@ -1,0 +1,157 @@
+---
+title: "Tools and Inputs: Giving Agents Data and Capabilities"
+sidebarTitle: "Tools & Inputs"
+description: "Learn how keyword arguments, plain functions, object namespaces, scoped values, and custom descriptions control what every JAZ agent can see and do."
+---
+
+Everything an agent receives — data, tools, and the task description itself — arrives through keyword arguments to `invoke()`. There is no separate tool registration step and no special prompt parameter. If you pass it as a keyword argument, the agent has it in its REPL as a live variable and can read a description of it in the prompt header. This single channel keeps tools and data uniform and discoverable.
+
+<Note>
+Positional arguments to `invoke()` are reserved for hooks (like `ReturnType(int)`) and an optional `ConfigOverride`. Data, tools, and prompts are **always** keyword arguments. `invoke("do the thing")` is a `TypeError`, not a prompt shorthand.
+</Note>
+
+## How Inputs Work
+
+Every keyword argument you pass becomes two things simultaneously:
+
+1. **A REPL variable** — the agent can reference it by name in any code turn.
+2. **A prompt entry** — the framework renders a description of the value in the prompt header so the agent knows what it has.
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+result = invoke(
+    ReturnType(dict),
+    task="Summarize the sales data by region",
+    sales_df=my_dataframe,
+    regions=["north", "south", "east", "west"],
+)
+```
+
+In the agent's REPL, `task`, `sales_df`, and `regions` are all bound as variables. In the prompt, each appears with a description the framework generates automatically (or one you supply via `jaz.describe`).
+
+## Tools Are Plain Functions
+
+A tool is any callable you pass as a keyword argument. The agent's description of that tool comes directly from its type signature and docstring — there is nothing to register, no decorator, no wrapper:
+
+```python
+def my_tool(x: int) -> int:
+    """Double a number."""
+    return x * 2
+
+result = invoke(ReturnType(int), task="Use my_tool on 5", my_tool=my_tool)
+```
+
+The agent sees the prompt entry: `` `my_tool(x: int) -> int`: Double a number. ``
+
+Type hints and a one-line docstring are what make a tool usable. The agent reads both when deciding how to call it.
+
+```python
+def web_search(query: str) -> list[str]:
+    """Search the web and return result snippets."""
+    ...
+
+result = invoke(
+    ReturnType(dict),
+    task="Look up each name and summarize what you find",
+    names=["ada", "grace"],
+    web_search=web_search,
+)
+```
+
+## Object Namespaces
+
+To group related tools under a single name, pass an instance of a class. The agent calls methods as `obj.method(...)`, and each public method is listed in the prompt as a catalog entry:
+
+```python
+class Utils:
+    """Utility helpers."""
+
+    def my_tool(self, x: int) -> int:
+        """Double a number."""
+        return x * 2
+
+    def format_result(self, value: int) -> str:
+        """Format an integer result for display."""
+        return f"Result: {value}"
+
+result = invoke(ReturnType(int), task="Use utils.my_tool on 5", utils=Utils())
+```
+
+The agent's prompt shows the `Utils` class docstring followed by each public method's signature and docstring. The agent calls them as `utils.my_tool(5)`.
+
+## Ambient Inputs with `jaz.scope`
+
+Passing the same tool or data object to every `invoke()` call in a nested workflow is error-prone — forget one level and it silently disappears from the subtree. `jaz.scope` binds values as ambient inputs that propagate automatically into every nested `invoke()` call for the duration of the `with` block:
+
+```python
+from jaz import invoke, scope
+
+def web_search(query: str) -> list[str]:
+    """Search the web and return result snippets."""
+    ...
+
+with scope(web_search=web_search):
+    # web_search is available here and in every nested invoke
+    result = invoke(
+        ReturnType(dict),
+        task="Research each topic and summarize findings",
+        topics=["quantum computing", "CRISPR"],
+    )
+```
+
+Scoped values are bound in the REPL and rendered in the prompt header just like explicit keyword arguments. Inner `scope` blocks shadow outer ones for the same name.
+
+<Warning>
+A name defined in `jaz.scope` **cannot** also be passed as an explicit `invoke()` keyword argument — doing so raises a `ValueError`. To give a single invoke a different value for a scoped name, wrap that call in a nested `with scope(name=new_value):` block instead.
+</Warning>
+
+## Attaching Custom Descriptions with `jaz.describe`
+
+By default, JAZ generates a description for each input from its type and docstring. For values where the auto-generated text is insufficient, `jaz.describe` attaches a permanent custom description that travels with the object:
+
+```python
+import jaz
+
+described_df = jaz.describe(
+    my_dataframe,
+    "Q1 2024 sales records: columns are region, product_sku, units_sold, revenue_usd.",
+)
+
+result = invoke(
+    ReturnType(dict),
+    task="Find the top 3 products by revenue",
+    sales=described_df,
+)
+```
+
+`jaz.describe` returns the original object unchanged — `describe(x, ...) is x` — and the description is attached by object identity, not by variable name. This means the same object carries its description into any nested `invoke()` without re-passing it.
+
+You can also pass a callable as the description, which is evaluated lazily each time the description is rendered:
+
+```python
+jaz.describe(tools, lambda v, name: f"Prefer `search` first.\n\n{jaz.get_default_description(v, name)}")
+```
+
+## Default Description Rendering
+
+When no description is attached, JAZ renders a default based on the value's type:
+
+<Accordion title="Default rendering rules">
+| Value type | Rendered as |
+|---|---|
+| Plain callable (function, method) | Signature + docstring: `` `fn(x: int) -> int`: Docstring text. `` |
+| Class | Class docstring + list of public members with their signatures/docstrings |
+| Object with a custom `__str__` | `str(value)` |
+| Object without a custom `__str__` | Class docstring + list of public instance attributes and methods |
+</Accordion>
+
+The function `jaz.get_default_description(value, bound_name)` is public and lets you compose with the default rather than replace it entirely:
+
+```python
+jaz.describe(
+    my_tools,
+    lambda v, name: f"Always validate inputs first.\n\n{jaz.get_default_description(v, name)}",
+)
+```

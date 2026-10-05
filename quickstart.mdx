@@ -1,47 +1,190 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with JAZ in Minutes"
+sidebarTitle: "Quickstart"
+description: "Install JAZ, set an API key, and run your first agent — from a simple integer result to tools and recursive sub-agents — in under five minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide takes you from a blank environment to a working JAZ agent. You will install the package, configure an API key, and progressively build up from a one-liner that returns an integer to an agent that calls a custom tool and spawns nested sub-agents.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Note>
+Every input to `invoke` — including the prompt — is a **keyword argument**. `invoke()`'s positional arguments are hooks (like `ReturnType(int)`) and an optional `ConfigOverride`. Writing `invoke("Calculate the factorial of 10")` is a `TypeError`, not a shorthand. Always use `invoke(task="...")` or any other keyword name that makes sense for your task.
+</Note>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+
+### Install JAZ
+
+Install the `jaz-lang` package from PyPI. The distribution is named `jaz-lang`; the import name is `jaz`.
+
+```bash
+pip install jaz-lang
+```
+
+Verify the install:
+
+```python
+import jaz
+print(jaz.__version__)
+```
+
+### Set your API key
+
+JAZ reads provider credentials from the environment using each provider's standard variable name.
+
+<Tabs>
+  <Tab title="OpenAI">
+    Export your key in your shell profile so it is always available, or set it for the current session:
 
     ```bash
-    npm install your-package
+    export OPENAI_API_KEY="sk-..."
     ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+    For a project-scoped key, add it to a `.env` file at the project root and load it with [direnv](https://direnv.net/):
 
     ```bash
-    your-cli init
+    # .env
+    OPENAI_API_KEY=sk-...
     ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
     ```bash
-    your-cli start
+    # .envrc  (direnv picks this up on cd)
+    dotenv
     ```
-  </Step>
-</Steps>
+
+    The default model route for LiteLLM is `openai/gpt-4o`. You can change the model at any time with `jaz.configure`.
+  </Tab>
+  <Tab title="GitHub Copilot (no API key)">
+    If you have a Copilot subscription, install the `copilot` extra and authenticate with the GitHub CLI — no provider API key required:
+
+    ```bash
+    pip install "jaz-lang[copilot]"
+    gh auth login
+    ```
+
+    Then configure JAZ to use the Copilot backend:
+
+    ```python
+    import jaz
+    from jaz.llm import CopilotLLM
+
+    jaz.configure(llm=CopilotLLM(model="gpt-4o"))
+    ```
+
+    Authentication checks `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN` in that order, then falls back to your `gh`/`copilot` CLI login.
+  </Tab>
+</Tabs>
+
+### Run your first invoke
+
+`invoke` runs an agent and returns its result. Pass a `ReturnType` hook to declare and enforce the return type:
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+result = invoke(
+    ReturnType(int),
+    task="Calculate the factorial of 10",
+)
+print(result)  # 3628800
+```
+
+The agent writes Python code in its REPL, executes it, observes the result, and calls `return 3628800` when done. JAZ validates that the returned value is an `int` before handing it back to you.
+
+### Pass custom data and get a list back
+
+Any keyword argument you pass becomes a named variable in the agent's REPL. The agent can read it, iterate over it, and use it directly:
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+result = invoke(
+    ReturnType(list),
+    task="Double each number in the list",
+    numbers=[1, 2, 3, 4, 5],
+)
+print(result)  # [2, 4, 6, 8, 10]
+```
+
+The agent sees the `numbers` variable bound in its namespace. Its docstring and type annotation (if any) render in the prompt header so the model knows what it is working with.
+
+### Add a custom tool
+
+A tool is just a Python function passed as a keyword argument. Its signature and docstring are what the agent reads — no registration, no decorator required:
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+
+def web_search(query: str) -> list[str]:
+    """Search the web and return result snippets."""
+    # Replace with a real implementation, e.g. using httpx + a search API
+    ...
+
+
+result = invoke(
+    ReturnType(dict),
+    task="Look up each name and summarize what you find",
+    names=["ada", "grace"],
+    web_search=web_search,
+)
+```
+
+The agent sees `` `web_search(query: str) -> list[str]`: Search the web and return result snippets. `` in its prompt and calls `web_search(...)` directly from its REPL. Tools and data sit side by side in the same call — no separate tool registry.
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+To group related tools under one name, pass an object instead of a function. The agent calls its public methods as `utils.my_tool(...)`. To make a tool available to all nested `invoke` calls automatically, use `jaz.scope`:
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+```python
+from jaz import scope, invoke
+from jaz.hooks import ReturnType
+
+with scope(web_search=web_search):
+    result = invoke(ReturnType(dict), task="Research these topics", topics=["AI", "Python"])
+    # nested invokes spawned by the agent also see `web_search`
+```
 </Tip>
+
+### Use recursive sub-agents
+
+An agent can call `jaz.invoke` inside its own REPL to delegate sub-tasks. Use `RecursionLimit` to cap the nesting depth:
+
+```python
+from jaz import invoke
+from jaz.hooks import RecursionLimit, ReturnType
+
+with RecursionLimit(max_depth=3):  # optional; recursion is unbounded by default
+    result = invoke(
+        ReturnType(list),
+        task="""
+        For each item, use jaz.invoke to process it independently.
+        Combine and return the results.
+        """,
+        items=["apple", "banana", "cherry"],
+    )
+```
+
+Each nested `invoke` inherits the hook context and budget from its parent. Budget hooks like `BudgetPool` automatically track cost and call counts across the entire recursion tree.
+
+</Steps>
+
+## What's Next
+
+You have a working JAZ agent. Explore the core concepts to understand the full power of the framework:
+
+<CardGroup cols={2}>
+  <Card title="Agent Loop" icon="arrows-rotate" href="/concepts/agent-loop">
+    Deep dive into the LLM-REPL conversation, event lifecycle, and how the agent decides when to stop.
+  </Card>
+  <Card title="Tools & Inputs" icon="wrench" href="/concepts/tools-and-inputs">
+    Passing functions, objects, and scoped data. How signatures and docstrings become tool descriptions.
+  </Card>
+  <Card title="Hooks" icon="webhook" href="/concepts/hooks">
+    Budget control, logging, tracing, iteration limits, and writing your own custom hooks.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/concepts/configuration">
+    Switching models, adjusting REPL timeouts, and using `ConfigOverride` for per-call settings.
+  </Card>
+</CardGroup>

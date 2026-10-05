@@ -1,0 +1,242 @@
+---
+title: "Protocol Component: Prompt Formatting and REPL Codec"
+sidebarTitle: "Protocol"
+description: "Configure CodeOnlyProtocol's prompt templates and output truncation, register Jinja2 loaders, and implement BaseProtocol for a custom LLM-REPL codec."
+---
+
+The protocol component is the codec between the LLM and the REPL. It has two responsibilities: encoding the session (formatting the initial system and user prompts from inputs and REPL history) and decoding each LLM response (parsing it into executable code). JAZ ships `CodeOnlyProtocol` as the default — a raw-code framing where the entire assistant message is executed verbatim as REPL input — plus `BaseProtocol` as the abstract base for custom implementations.
+
+```python
+from jaz.protocol import CodeOnlyProtocol, BaseProtocol
+```
+
+## CodeOnlyProtocol
+
+`CodeOnlyProtocol` implements the **raw-code framing**: the model's entire response is sent verbatim to the REPL as code. There is no XML wrapper, no markdown fence, and no delimiter of any kind. Natural-language reasoning goes in leading comments, which travel with the code into the execution record.
+
+The protocol handles three things:
+
+1. **Parsing** — takes the LLM response content as-is; `parse()` never fails (a prose preamble or empty response reaches the REPL and surfaces as a `SyntaxError` or a no-op, not a protocol error).
+2. **System and user prompt rendering** — formats the initial `[system, user]` message list from inputs, scope, the REPL's self-description, and the wire-format instructions.
+3. **Observation rendering** — wraps each REPL `Continue` result as the next user message, with optional truncation applied.
+
+```python
+import jaz
+from jaz.protocol import CodeOnlyProtocol
+
+jaz.configure(protocol=CodeOnlyProtocol(
+    max_repl_output_length=20000,
+    truncation_prefix_ratio=0.5,
+))
+```
+
+### Constructor Parameters
+
+<ParamField path="max_invoke_input_length" type="int" default="50000">
+  Maximum number of characters per input value in the rendered prompt header. Inputs longer than this are abbreviated symmetrically around their midpoint (split by `truncation_prefix_ratio`). Must be a positive integer.
+</ParamField>
+
+<ParamField path="max_repl_output_length" type="int" default="50000">
+  Maximum number of characters of REPL output fed back to the LLM as the observation message. Output exceeding this limit is abbreviated with a `[...N characters omitted...]` marker. Must be a positive integer. This truncation is applied to the **observation message only** — `__history__[-1].repl_output` always holds the full, untruncated output.
+</ParamField>
+
+<ParamField path="truncation_prefix_ratio" type="float" default="0.5">
+  When abbreviating a value (input or REPL output), this fraction of the character budget is kept from the **start** of the value and the remainder from the **end**. `0.5` keeps an even split; `1.0` keeps only the start; `0.0` keeps only the end. Must be between `0.0` and `1.0` inclusive. No ratio guarantees that error text reaches the agent — a traceback at the start of output survives a prefix-heavy ratio, while one at the end survives only a suffix-heavy one.
+</ParamField>
+
+<ParamField path="system_prompt_template" type="str" default="jaz/system_prompt.jinja2">
+  Jinja2 template name for the system prompt. The template receives the REPL description, wire-format instructions, history description, scoped inputs, and recursion context. Override to customise the agent's initial instructions. Must be a non-empty string.
+</ParamField>
+
+<ParamField path="user_prompt_template" type="str" default="jaz/user_prompt.jinja2">
+  Jinja2 template name for the user prompt (the opening user message containing the invoke inputs). Override to customise how inputs are presented. Must be a non-empty string.
+</ParamField>
+
+<ParamField path="python_repl_description_template" type="str">
+  Passed to `PythonREPL` via `repl_description_template` to override the REPL's self-description block in the system prompt. Set this on `PythonREPL` directly: `PythonREPL(repl_description_template="myproject/repl_desc.jinja2")`.
+</ParamField>
+
+<ParamField path="subinvoke_description" type="str | None" default="None">
+  An explicit agent-facing description of the recursive `invoke` tool, overriding the default (which introspects the bound closure's signature and docstring). Set this to advertise a narrower surface — for example, an inputs-only signature when a `restrict_invoke_args`-style guard vetoes positional-hook `invoke` calls at runtime. `None` derives the description from the closure. Must be a non-empty string when set.
+</ParamField>
+
+---
+
+## Custom Prompt Templates
+
+`CodeOnlyProtocol` renders prompts from Jinja2 templates. You can override any template by pointing to your own file. Register custom template loaders with `jaz.add_template_loader()` to make your templates discoverable by name.
+
+### jaz.add_template_loader
+
+`jaz.add_template_loader(loader)` registers a Jinja2 loader so templates it provides are found when a template name is requested. Use a `jinja2.FileSystemLoader` to load templates from a local directory, or a `jinja2.PackageLoader` to ship templates inside a Python package.
+
+```python
+import jinja2
+import jaz
+from jaz.protocol import CodeOnlyProtocol
+
+# Load templates from a local directory
+jaz.add_template_loader(jinja2.FileSystemLoader("/path/to/my/templates"))
+
+# Now use your custom template
+jaz.configure(protocol=CodeOnlyProtocol(
+    system_prompt_template="my_system_prompt.jinja2",
+))
+```
+
+<Note>
+  Loaders registered with `jaz.add_template_loader()` are searched **before** the built-in JAZ templates, so a custom template with the same name as a built-in overrides it. Templates use Jinja2's `StrictUndefined` — referencing an unbaked variable raises immediately rather than rendering an empty string.
+</Note>
+
+### Template variables
+
+The system prompt template receives these variables from `CodeOnlyProtocol`:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `format_instructions` | `str` | The wire-format codec instructions (owned by the protocol) |
+| `history_description` | `str` | The `__history__` entry field description |
+| `repl` | `BaseREPL` | The configured REPL (for `repl.description`) |
+| `subinvoke_description` | `str \| None` | The `invoke` tool description, or `None` |
+| `depth` | `int` | Recursion depth (0 at top level) |
+| `recursion_available` | `bool` | Whether sub-invokes are permitted |
+| `scoped_input_blocks` | `str` | Rendered scoped input blocks |
+| `scoped_names` | `list[str]` | Names of the scoped inputs |
+
+<Tip>
+  To suppress the `__history__` block without changing the codec, extend the built-in template and override its `repl_history` block:
+
+  ```jinja2
+  {% extends "jaz/system_prompt.jinja2" %}
+  {% block repl_history %}{% endblock %}
+  ```
+</Tip>
+
+---
+
+## History Record: REPLHistoryEntry
+
+`CodeOnlyProtocol` projects each turn into a `REPLHistoryEntry`, accessible in agent code as `__history__[-1]`. The entry shape belongs to the protocol — a custom protocol may return a different type from `build_history_entry()`.
+
+<ResponseField name="llm_response" type="str">
+  The full LLM response for that iteration (the raw model output, including comments and reasoning). Under `CodeOnlyProtocol` this is the same as the code, since the message **is** the code.
+</ResponseField>
+
+<ResponseField name="repl_output" type="str">
+  The printed output from that iteration, including any error traceback. Always a `str` — a terminal `Return`/`Raise` turn records `""` (the finishing code's stdout is not captured).
+</ResponseField>
+
+<ResponseField name="repl_exception" type="BaseException | None">
+  The raw exception object for a recoverable error (`Continue` with `exception` set), or `None` for a clean success, a terminal `Return`, or a terminal `Raise`.
+</ResponseField>
+
+```python
+# Agent code — reading history inside the REPL
+last = __history__[-1]
+print(last.repl_output)          # The output the agent saw last turn
+if last.repl_exception:
+    print(type(last.repl_exception).__name__)  # e.g. "ImportError"
+```
+
+---
+
+## BaseProtocol
+
+`BaseProtocol` is the abstract base for all protocol implementations. Subclass it to provide a custom codec — for example, a tool-calling protocol, a ReAct-framing protocol, or one that wraps code in XML tags.
+
+```python
+from jaz.protocol import BaseProtocol, ParsedCode
+from jaz._llm_client import LLMResponse
+
+class MyProtocol(BaseProtocol):
+    def parse(self, llm_response: LLMResponse) -> ParsedCode:
+        # Extract code from the response; never raise
+        code = extract_code_from_xml(llm_response.content or "")
+        return ParsedCode(code=code, exec_timeout_override=None)
+
+    def format_instructions(self) -> str:
+        return "Wrap your code in <code>...</code> tags."
+
+    def render_observation(self, exec_result, iteration):
+        return [{"role": "user", "content": exec_result.output}]
+
+    def render_initial_message_list(self, inputs, scope, repl, *, ...):
+        ...
+
+    def build_history_entry(self, llm_response, exec_result):
+        ...
+
+    def get_history_description(self) -> str:
+        return "Each `__history__` entry has `.code` and `.output` fields."
+```
+
+### ParsedCode
+
+`parse()` must return a `ParsedCode` named tuple:
+
+<ResponseField name="code" type="str">
+  The extracted code string to send to the REPL.
+</ResponseField>
+
+<ResponseField name="exec_timeout_override" type="float | None">
+  An optional per-exec timeout in seconds, or `None` to use the REPL's configured `exec_timeout`. The `# timeout:` pragma in the code outranks this when both are present.
+</ResponseField>
+
+<Accordion title="BaseProtocol abstract method reference">
+
+**`parse(llm_response: LLMResponse) → ParsedCode`**
+
+Decode the LLM response into code. Must never raise — a parse failure would end the invoke with no recovery. Return the message verbatim when extraction fails and let the REPL surface the SyntaxError.
+
+**`format_instructions() → str`**
+
+Return the wire-format instruction block that tells the LLM how to shape its response. This is the **request half** of the codec; `parse()` is the accept half. They must stay in sync.
+
+**`render_observation(exec_result: Continue, iteration: int) → list[MessageDict]`**
+
+Render a continuing REPL result as the next turn's message(s). Returns a list so protocols that use multi-block or parallel tool-call observations can express them.
+
+**`render_initial_message_list(inputs, scope, repl, *, invoke_tool, depth, recursion_available, input_display_overrides) → list[MessageDict]`**
+
+Build the opening `[system, user]` message list for a new invoke session.
+
+**`build_history_entry(llm_response: LLMResponse | None, exec_result: ExecResult) → object`**
+
+Project one turn into its `__history__` entry. The return type is `object` — the shape is entirely the protocol's to define.
+
+**`get_history_description() → str`**
+
+Return the prompt text describing the `__history__` list and entry fields. Return `""` for a protocol whose history is not agent-readable. This is abstract so every protocol author explicitly chooses a description.
+
+**`get_subinvoke_description(invoke_tool: InvokeTool) → str`**
+
+Return the agent-facing description of the recursive `invoke` tool. The default introspects the closure's signature and docstring. Override to advertise a narrower interface.
+
+</Accordion>
+
+---
+
+## Configuring the Protocol
+
+Pass a configured `CodeOnlyProtocol` instance to `jaz.configure()`:
+
+```python
+import jaz
+from jaz.protocol import CodeOnlyProtocol
+
+jaz.configure(protocol=CodeOnlyProtocol(
+    max_repl_output_length=20000,
+    truncation_prefix_ratio=0.0,  # Keep the tail (where tracebacks usually land)
+    system_prompt_template="myproject/system_prompt.jinja2",
+))
+```
+
+Use `jaz.ConfigOverride` to apply a different protocol for one scoped block:
+
+```python
+import jaz
+from jaz.protocol import CodeOnlyProtocol
+
+with jaz.ConfigOverride(protocol=CodeOnlyProtocol(max_repl_output_length=5000)):
+    result = jaz.invoke(task="Summarise this document.", document=long_text)
+```

@@ -1,0 +1,292 @@
+---
+title: "REPL Component: PythonREPL and Sandbox Configuration"
+sidebarTitle: "REPL"
+description: "Configure PythonREPL: exec_timeout, memory limits, and sandbox allow-lists for imports, attributes, and file paths. Subclass BaseREPL for custom backends."
+---
+
+The REPL component is one of the three independently-pluggable parts of a JAZ agent loop (alongside the LLM and the Protocol). It receives code from the protocol, executes it, and returns a typed result that the loop feeds back to the model. JAZ ships `PythonREPL` as the default — a sandboxed Python executor with compile-time and runtime safety policies — plus `BaseREPL` as the abstract base for custom backends.
+
+```python
+from jaz.repl import PythonREPL, BaseREPL, ExecResult, Continue, Return, Raise
+```
+
+## PythonREPL
+
+`PythonREPL` executes agent code in a secured Python namespace. Sandbox policy is **fail-closed by default**: every axis — imports, attribute access, and filesystem operations — denies all access unless the host explicitly grants it. A configured instance is a pure, reusable template: `initialize()` returns a fresh `REPLState` per invoke, so one `PythonREPL` can safely serve many concurrent invokes without state bleed.
+
+<Warning>
+`allowed_imports=[]` (deny all) is the secure default. An unconfigured `PythonREPL` cannot import anything. Grant access explicitly: use a named allow-list like `["json", "re", "math"]` to permit specific modules, or `["*"]` to permit all. Widening the sandbox should be an explicit, audited decision — agent code runs imports you may not expect.
+</Warning>
+
+```python
+import jaz
+from jaz.repl import PythonREPL
+
+# Deny all imports (default — secure baseline)
+jaz.configure(repl=PythonREPL())
+
+# Allow specific modules only
+jaz.configure(repl=PythonREPL(
+    allowed_imports=["json", "re", "math", "datetime"],
+    exec_timeout=60.0,
+))
+
+# Allow all imports with a timeout and memory cap
+jaz.configure(repl=PythonREPL(
+    allowed_imports=["*"],
+    exec_timeout=30.0,
+    exec_memory_limit=512 * 1024 * 1024,  # 512 MB
+))
+```
+
+### Constructor Parameters
+
+<ParamField path="exec_timeout" type="float | None" default="30.0">
+  Per-execution wall-clock bound in seconds. When the agent's code exceeds this limit, execution is interrupted and the agent receives a timeout error as recoverable feedback. Set to `None` to disable the timeout entirely (unbounded). By default, agents can override this per execution with a leading `# timeout: <seconds>` comment in their code — disable that with `allow_timeout_pragma=False`.
+</ParamField>
+
+<ParamField path="exec_memory_limit" type="int | None" default="None">
+  Process-wide RSS ceiling in bytes, per execution. When resident memory exceeds this limit during a turn, execution is interrupted. Set to `None` (the default) to disable memory enforcement entirely. Example: `exec_memory_limit=512 * 1024 * 1024` for a 512 MB cap.
+</ParamField>
+
+<ParamField path="allowed_imports" type="list[str] | None" default="None">
+  gitignore-style allowlist matched against the **root module name** at import time. `None` applies the secure default — `[]`, which denies all imports. `["*"]` allows every import. Specific modules: `["json", "re", "math"]`. The list is enforced both statically (at compile time) and dynamically (at runtime via the `__import__` wrapper). Neither axis can be bypassed by agent code.
+</ParamField>
+
+<ParamField path="allowed_attributes" type="list[str] | None" default="None">
+  gitignore-style allowlist for attribute access (`obj.attr`, `getattr`, `setattr`, `delattr`, `hasattr`, `vars`). `None` applies the secure default: allow all attributes **except** double-underscore-prefixed names (`__*`) and the frame-bearing interpreter surface (`f_back`, `gi_frame`, `cr_frame`, etc.). `["*"]` allows everything including dunders. `[]` denies all attribute access. Enforced both statically (AST checker) and at runtime.
+</ParamField>
+
+<ParamField path="allowed_read_paths" type="list[str] | None" default="None">
+  gitignore-style glob allowlist for filesystem **reads** via `open()`. `None` applies the secure default — `[]`, which denies all file reads. See [Path anchor syntax](#path-anchor-syntax) below for glob anchoring rules. `["//**"]` grants the whole filesystem; `["~/**"]` grants the home directory; `["**"]` grants the current working directory subtree.
+</ParamField>
+
+<ParamField path="allowed_write_paths" type="list[str] | None" default="None">
+  gitignore-style glob allowlist for filesystem **writes** via `open()` (write, append, and write-capable modes). Independent from `allowed_read_paths` — a path may be readable but not writable. Same anchoring rules and same fail-closed default as `allowed_read_paths`.
+</ParamField>
+
+<ParamField path="allow_timeout_pragma" type="bool" default="True">
+  When `True`, a `# timeout: <seconds>` comment among the opening lines of the agent's code overrides `exec_timeout` for that execution (with no ceiling — the agent can request more time than the default). Set `False` to make `exec_timeout` a hard, per-execution ceiling the agent cannot raise.
+</ParamField>
+
+<ParamField path="allow_raise" type="bool" default="True">
+  When `True`, a top-level `raise` statement (not nested inside a function or class) exits the REPL and ends the invoke by raising that exception. When `False`, only `return` is available as a finish — a top-level `raise` is left as ordinary Python and is not treated as a finish.
+</ParamField>
+
+<ParamField path="reject_finish_on_printed_output" type="bool" default="True">
+  When `True`, a finishing `return` or `raise` is rejected (converted to a `Continue`) if the same code block also printed output. The agent must review the output and issue the `return`/`raise` alone on the next iteration. When `False`, finishing is allowed even when the turn also produced printed output.
+</ParamField>
+
+<ParamField path="traceback_verbosity" type="str" default="all">
+  Controls how much of an exception traceback the agent sees. REPL engine frames are always stripped. Accepted values:
+
+  - `"all"` — the agent's own frames plus any library frames it called into.
+  - `"repl_only"` — only the agent's own `<repl_...>` frames; library frames and their file paths are dropped (useful when benchmark identity must be hidden).
+  - `"message_only"` — just `ExceptionType: message`, no frames at all.
+</ParamField>
+
+<ParamField path="repl_description_template" type="str" default="jaz/python_repl_description.jinja2">
+  Jinja2 template name for the REPL description block in the system prompt. Override to customise how the REPL is described to the agent. The template receives `allow_raise`, `exec_timeout`, `allow_timeout_pragma`, `allowed_imports`, `allowed_read_paths`, and `allowed_write_paths` as render variables.
+</ParamField>
+
+---
+
+## Sandbox Policy
+
+### Path Anchor Syntax
+
+File path globs in `allowed_read_paths` and `allowed_write_paths` use gitignore-style matching with the following anchor conventions:
+
+| Prefix | Anchors to |
+|--------|-----------|
+| `//`   | Filesystem root (`/`) |
+| `~/`   | User home directory |
+| `/` or `./` | Current working directory (top) |
+| (bare, no slash) | Current working directory (recursive) |
+
+<Tabs>
+  <Tab title="Common patterns">
+    ```python
+    PythonREPL(
+        # Allow reading anything in /tmp
+        allowed_read_paths=["//tmp/**"],
+
+        # Allow writing only to a specific output directory
+        allowed_write_paths=["//home/user/output/**"],
+    )
+    ```
+  </Tab>
+  <Tab title="Home directory">
+    ```python
+    PythonREPL(
+        # Grant home directory reads, but exclude .jaz credentials
+        allowed_read_paths=["~/**", "!~/.jaz/**"],
+        allowed_write_paths=["~/output/**"],
+    )
+    ```
+  </Tab>
+  <Tab title="CWD only">
+    ```python
+    PythonREPL(
+        # Allow reading the whole CWD subtree
+        allowed_read_paths=["**"],
+        # Deny all writes
+        allowed_write_paths=[],
+    )
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  The allow-list is authoritative. A path you grant is granted — there are no hidden denials. If you allow `~/\*\*`, that includes `~/.jaz/`. Use negation patterns like `["~/**", "!~/.jaz/**"]` to exclude specific subdirectories.
+</Note>
+
+### Default Attribute Policy
+
+When `allowed_attributes=None`, the secure default allows all attributes **except**:
+
+- Any double-underscore-prefixed name (`__globals__`, `__mro__`, `__dict__`, `__subclasses__`, etc.)
+- The frame-bearing interpreter surface: `f_back`, `f_builtins`, `f_code`, `f_globals`, `f_locals`, `gi_frame`, `cr_frame`, `ag_frame`, `tb_frame`, `tb_next`, and related names that can be used to walk the call stack and escape the sandbox.
+
+Three dunders are re-admitted on **reads only**: `__init__`, `__name__`, and `__qualname__` (needed for `super().__init__(...)` and `type(x).__name__`). The write axis (`setattr`/`delattr`) keeps them denied to prevent agent code from patching class constructors.
+
+<Warning>
+  The default attribute sandbox is defense-in-depth, not a tight boundary. Two known residuals: `str.format` accesses attributes at the C level bypassing the runtime wrapper, and a module reachable through an ordinary attribute of a host-supplied input bypasses all axes. For genuinely untrusted code, use OS/process-level isolation.
+</Warning>
+
+---
+
+## Execution Results
+
+Every `exec()` call returns exactly one of three result types, collectively typed as `ExecResult`:
+
+<Tabs>
+  <Tab title="Continue">
+    The code ran and the REPL session continues. Carries `output` (the text fed back to the LLM) and an optional `exception` for recoverable errors.
+
+    ```python
+    from jaz.repl import Continue
+
+    result: Continue
+    print(result.output)       # str: stdout + traceback on error
+    print(result.exception)    # BaseException | None: None on clean success
+    ```
+  </Tab>
+  <Tab title="Return">
+    The agent finished the session with a top-level `return` statement. Carries the returned value.
+
+    ```python
+    from jaz.repl import Return
+
+    result: Return
+    print(result.return_value)  # The value the agent returned
+    ```
+  </Tab>
+  <Tab title="Raise">
+    The agent finished the session by raising an exception (with `allow_raise=True`). Carries the exception object.
+
+    ```python
+    from jaz.repl import Raise
+
+    result: Raise
+    print(result.exception)     # BaseException: the raised exception
+    ```
+  </Tab>
+</Tabs>
+
+`ExecResult` is the type surfaced on hook `event.exec_result` and in effect payloads. A `Continue` with `exception` set is a **recoverable error** — the agent sees the error output and can retry. A `Return` or `Raise` is a **terminal result** that ends the invoke.
+
+---
+
+## BaseREPL
+
+`BaseREPL` is the abstract base class for all REPL implementations. Subclass it to provide a custom execution backend — a different language runtime, a remote sandbox, or a process-isolated executor.
+
+A REPL is **configured at construction** (sandbox policy, timeouts, finishing rules) and **initialized per invoke** (`initialize()` returns a `REPLState`). The instance itself holds no per-invoke state, so a single configured REPL safely serves many concurrent invokes.
+
+```python
+from jaz.repl import BaseREPL, REPLState, ExecResult
+from jaz._invoke_tool import InvokeTool
+
+class MyREPL(BaseREPL):
+    description = "A custom REPL that ..."
+
+    def initialize(
+        self,
+        inputs: dict,
+        invoke_tool: InvokeTool | None,
+        allowed_builtins: dict | None = None,
+        session_id: str = "",
+        initial_repl_history: list | None = None,
+    ) -> REPLState:
+        # Build and return a fresh REPLState for this invoke
+        ...
+
+    def exec(self, state: REPLState, src: str, code_id: str,
+             exec_timeout_override: float | None = None) -> ExecResult:
+        # Execute src, mutate state in place, return an ExecResult
+        ...
+
+    def add_inputs(self, state: REPLState, inputs: dict) -> None: ...
+    def add_variables(self, state: REPLState, variables: dict) -> None: ...
+    def drop_variables(self, state: REPLState, names, allow_missing=()) -> None: ...
+```
+
+<Accordion title="BaseREPL abstract method reference">
+
+**`initialize(inputs, invoke_tool, allowed_builtins, session_id, initial_repl_history) → REPLState`**
+
+Build one invoke's `REPLState`. Called once per invoke. The returned state is threaded into every subsequent `exec()`, `add_variables()`, and `drop_variables()` call for that invoke.
+
+**`exec(state, src, code_id, exec_timeout_override) → ExecResult`**
+
+Execute REPL code against `state`, mutating it in place. Recoverable errors in the code should be captured and returned as `Continue(output=..., exception=...)`. Exceptions that must escape the invoke (fatal errors, foreign timeouts) should re-raise.
+
+**`aexec(state, src, code_id, exec_timeout_override) → ExecResult`**
+
+Async version of `exec()`. The default implementation runs `exec()` in a thread pool via `asyncio.to_thread`.
+
+**`add_inputs(state, inputs) → None`**
+
+Add inputs to the REPL environment, applying `__jaz_get__` payload substitution (so injected `Library`/`jaz.wrap` objects bind their payload).
+
+**`add_variables(state, variables) → None`**
+
+Bind variables **verbatim** into the REPL namespace. Raises `REPLInputConflictError` if a name is already bound. Refuses `__builtins__`.
+
+**`drop_variables(state, names, allow_missing) → None`**
+
+Remove names from the REPL namespace. Raises `MissingDropTargetError` for absent names unless `allow_missing` covers them. Never drops `__builtins__`.
+
+</Accordion>
+
+---
+
+## Configuring the REPL
+
+Pass a configured `PythonREPL` instance to `jaz.configure()` to set it as the default for all subsequent invokes on the current thread:
+
+```python
+import jaz
+from jaz.repl import PythonREPL
+
+jaz.configure(repl=PythonREPL(
+    exec_timeout=60.0,
+    allowed_imports=["json", "re", "math", "collections", "itertools"],
+    allowed_read_paths=["//data/**"],
+    allowed_write_paths=["//output/**"],
+))
+
+result = jaz.invoke(task="Analyse the dataset and return the summary.")
+```
+
+Use `jaz.ConfigOverride` to apply a different REPL for a scoped block:
+
+```python
+import jaz
+from jaz.repl import PythonREPL
+
+# Wider sandbox for one specific invoke
+with jaz.ConfigOverride(repl=PythonREPL(allowed_imports=["*"])):
+    result = jaz.invoke(task="Run the benchmarks.")
+```

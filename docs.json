@@ -1,72 +1,98 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "JAZ",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#0f172a",
+    "light": "#4e9dfa",
+    "dark": "#fa5d5f"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
+  "favicon": "https://media.brand.dev/6b239e51-6d3a-4969-8ace-e4e81883a48c.svg",
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/jaz-lang/jaz"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/jaz-lang/jaz"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/agent-loop",
+              "concepts/tools-and-inputs",
+              "concepts/hooks",
+              "concepts/configuration"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/budget-control",
+              "guides/custom-hooks",
+              "guides/llm-backends",
+              "guides/tracing",
+              "guides/async",
+              "guides/console"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/invoke",
+              "api/configure",
+              "api/scope",
+              "api/describe"
+            ]
+          },
+          {
+            "group": "Hooks",
+            "pages": [
+              "api/hooks/overview",
+              "api/hooks/builtin",
+              "api/hooks/events",
+              "api/hooks/effects"
+            ]
+          },
+          {
+            "group": "LLM Backends",
+            "pages": [
+              "api/llm/overview",
+              "api/llm/litellm",
+              "api/llm/custom-backend"
+            ]
+          },
+          {
+            "group": "REPL & Protocol",
+            "pages": [
+              "api/repl",
+              "api/protocol",
+              "api/exceptions"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

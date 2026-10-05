@@ -1,0 +1,204 @@
+---
+title: "LiteLLM Backend: Route to Any LLM Provider"
+sidebarTitle: "LiteLLM"
+description: "Configure LiteLLM constructor params, provider routing, per-request defaults, retry policy, and local OpenAI-compatible server setup."
+---
+
+`LiteLLM` is JAZ's default backend and the only one covered by the stable v1 API. Rather than posting directly to a single vendor's HTTP endpoint, it delegates every completion call to the `litellm` library — a unified routing layer that reaches OpenAI, Anthropic, Google Gemini, AWS Bedrock, Google Vertex AI, and dozens of other providers through one interface. This means a model released after your JAZ version is immediately usable: update `litellm`, update the model ID, and you're done.
+
+```python
+from jaz.llm import LiteLLM
+
+import jaz
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"))
+```
+
+<Note>
+Importing `litellm` takes approximately 2 seconds and pulls a large dependency tree. JAZ defers this import until the first LLM call, so `import jaz` itself remains fast.
+</Note>
+
+## Constructor parameters
+
+<ParamField path="model" type="str" required>
+  The LiteLLM routing key for the model to use. Forwarded verbatim to `litellm.completion` — write it exactly as LiteLLM's documentation writes it, including the `provider/` prefix. Examples: `"openai/gpt-5-mini"`, `"anthropic/claude-opus-4-5"`, `"gemini/gemini-2.5-pro"`, `"vertex_ai/gemini-2.5-pro"`.
+
+  A bare model name without a prefix (e.g. `"gpt-5-mini"`) also works; LiteLLM infers the provider. The prefix is recommended for clarity and to avoid ambiguity when multiple providers serve the same base name.
+</ParamField>
+
+<ParamField path="api_base" type="str | None" default="None">
+  Override the API endpoint URL. Used to point `LiteLLM` at a local or self-hosted OpenAI-compatible server such as Ollama, vLLM, LM Studio, or llama.cpp. When `None`, LiteLLM uses the provider's default endpoint.
+</ParamField>
+
+<ParamField path="api_key" type="str | None" default="None">
+  Explicit API key to pass to LiteLLM. When `None`, JAZ first checks the provider's standard environment variable (e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) and then the credential stored in `~/.jaz/credentials.json`. An explicit `api_key` here takes highest precedence and overrides both.
+
+  For local servers using the `openai/` route prefix, the OpenAI route requires a non-empty key even when no real authentication is needed — any non-empty string (e.g. `"dummy"`) satisfies it.
+</ParamField>
+
+<ParamField path="temperature" type="float | None" default="None">
+  Sampling temperature passed through to the model on every call. A per-request default: settable at construction and applied uniformly unless a specific call overrides it. `None` leaves the provider's own default in effect.
+</ParamField>
+
+<ParamField path="max_tokens" type="int | None" default="None">
+  Maximum number of tokens to generate per call. Applied as a per-request default. `None` lets the provider apply its own limit.
+</ParamField>
+
+<ParamField path="reasoning_effort" type="str | None" default="None">
+  Reasoning effort level for models that support it (e.g. OpenAI o-series). Accepted values depend on the provider. `None` leaves the provider default in effect.
+</ParamField>
+
+<ParamField path="max_retries" type="int" default="10">
+  Number of **extra** retries after the first failed call (LLM-SDK convention: `max_retries=2` means up to 3 total calls; `0` disables retry). Inherited from `BaseLLM`. Default is 10 to provide resilience during long autonomous agent runs.
+
+  Must be a non-negative integer.
+</ParamField>
+
+<ParamField path="retry_wait_multiplier" type="float" default="1.0">
+  Exponential backoff multiplier. Controls how aggressively wait times grow between retries. Must be positive.
+</ParamField>
+
+<ParamField path="retry_wait_min" type="float" default="4.0">
+  Minimum wait time in seconds before the first retry. Must be non-negative.
+</ParamField>
+
+<ParamField path="retry_wait_max" type="float" default="60.0">
+  Maximum wait time in seconds between retries. The backoff is capped at this value regardless of the multiplier. Must be positive.
+</ParamField>
+
+<ParamField path="allowed_openai_params" type="list[str] | None" default="None">
+  Parameters that LiteLLM would normally reject for a given model, forced through validation. Use this to pass a parameter that your installed LiteLLM version does not yet recognize for a newly released model. `None` leaves LiteLLM's own validation in charge.
+</ParamField>
+
+<ParamField path="drop_params" type="bool | None" default="None">
+  When `True`, LiteLLM silently drops unknown parameters instead of raising an error. A config-file escape hatch for models too new for the installed LiteLLM version. `None` uses LiteLLM's default behavior.
+</ParamField>
+
+<ParamField path="**request_defaults" type="Any">
+  Any additional keyword arguments (e.g. `top_p`, `stop`, `seed`, `response_format`) are stored as per-request defaults and merged into every `litellm.completion` call. JAZ warns at construction time if a kwarg closely resembles a known parameter name but is not recognized — a likely typo guard.
+</ParamField>
+
+## Supported providers
+
+`LiteLLM` routes to every provider the `litellm` library supports. The model ID's `provider/` prefix selects the route:
+
+| Provider | Prefix | Credential variable |
+|----------|--------|---------------------|
+| OpenAI | `openai/` | `OPENAI_API_KEY` |
+| Anthropic | `anthropic/` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `gemini/` | `GEMINI_API_KEY` |
+| AWS Bedrock | `bedrock/` | AWS credentials |
+| Google Vertex AI | `vertex_ai/` | GCP credentials |
+
+Credentials are resolved per request in priority order: explicit `api_key` argument → provider environment variable → `~/.jaz/credentials.json` stored credential. This means a call to `jaz.set_credential("openai", "sk-...")` in the JAZ console takes effect on the next `invoke()` call without restarting anything.
+
+## Cost reporting
+
+`LiteLLM` prices calls through LiteLLM's own `litellm.completion_cost()` calculator rather than JAZ's bundled pricing table. This is intentional: pricing a model too new for a bundled snapshot is the whole reason this backend exists. A model LiteLLM has not yet mapped reports `cost_usd=None`; `can_report_cost()` returns `False` for it, so a `BudgetPool(cost_budget=...)` set on that model is rejected before any tokens are spent.
+
+<Info>
+Cache write pricing requires `litellm>=1.87.0`. With an older version, cache writes are priced at $0. JAZ's `pyproject.toml` pins `litellm>=1.87.0` as a minimum dependency.
+</Info>
+
+## Examples
+
+<CodeGroup>
+
+```python OpenAI
+import jaz
+from jaz.llm import LiteLLM
+
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"))
+
+# With per-request defaults
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/gpt-5-mini",
+        temperature=0.7,
+        max_tokens=2000,
+    )
+)
+```
+
+```python Anthropic
+import jaz
+from jaz.llm import LiteLLM
+
+jaz.configure(llm=LiteLLM(model="anthropic/claude-opus-4-5"))
+
+# With reasoning effort for extended thinking
+jaz.configure(
+    llm=LiteLLM(
+        model="anthropic/claude-opus-4-5",
+        max_tokens=16000,
+        thinking={"type": "enabled", "budget_tokens": 10000},
+    )
+)
+```
+
+```python Local Ollama
+import jaz
+from jaz.llm import LiteLLM
+
+# Route the openai/ prefix to a local Ollama server.
+# api_key is required by the openai/ route even for a local server;
+# any non-empty string is fine.
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/llama3",
+        api_base="http://localhost:11434/v1",
+        api_key="dummy",
+    )
+)
+```
+
+```python AWS Bedrock
+import jaz
+from jaz.llm import LiteLLM
+
+# Bedrock uses AWS credential chain (env vars, ~/.aws/credentials, IAM role).
+# No api_key needed; set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION_NAME.
+jaz.configure(
+    llm=LiteLLM(model="bedrock/anthropic.claude-opus-4-5-v1:0")
+)
+```
+
+</CodeGroup>
+
+## Per-invoke override
+
+Use `ConfigOverride` to switch the backend for a single `invoke()` call without touching the global configuration:
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+
+# Global default
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"))
+
+# Override for one call
+with jaz.ConfigOverride(llm=LiteLLM(model="anthropic/claude-opus-4-5")):
+    result = jaz.invoke(task="Write a detailed analysis")
+
+# Back to gpt-5-mini here
+```
+
+## Retry policy
+
+The `retry_policy` parameter accepts a mapping from exception class name to a per-error retry budget. This overrides `max_retries` for the named exception types while leaving the default budget in place for everything else:
+
+```python
+from jaz.llm import LiteLLM
+
+llm = LiteLLM(
+    model="openai/gpt-5-mini",
+    max_retries=5,           # default for unlisted retryable errors
+    retry_policy={
+        "RateLimitError": 20,     # rate limits get more retries
+        "APIError": 8,            # transient server errors: moderate budget
+    },
+    retry_wait_min=2.0,
+    retry_wait_max=120.0,
+)
+```
+
+Each error type's budget is tracked independently — a burst of `RateLimitError`s cannot consume the `APIError` allowance.

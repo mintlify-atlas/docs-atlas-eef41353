@@ -1,0 +1,199 @@
+---
+title: "Controlling Agent Costs, Iterations, and Recursion"
+sidebarTitle: "Budget Control"
+description: "Use BudgetPool, IterationLimit, RecursionLimit, and BudgetForcing to cap LLM spend, limit turns per invoke, bound recursion depth, and enforce thorough reasoning."
+---
+
+JAZ ships several opt-in hooks that give you fine-grained control over how much an agent spends, how many turns it takes, how deeply it recurses, and whether it is allowed to finish early. All of them compose naturally as context managers and are found in `jaz.hooks`.
+
+## BudgetPool — shared cost and call-count budget
+
+`BudgetPool` enforces one shared LLM cost or call-count allowance over everything inside its scope. Every invoke that runs while the hook is active draws from the same pool. When the aggregate spend or call count reaches the ceiling, the next LLM query is aborted with `BudgetPoolExhaustedError` — there is no grace turn.
+
+```python
+from jaz import invoke
+from jaz.hooks import BudgetPool, ReturnType
+
+with BudgetPool(cost_budget=0.50, calls_budget=100):
+    result = invoke(ReturnType(str), task="Build a web scraper")
+```
+
+<Note>
+The budget pool only covers invokes that run **inside the `with` block**. Passing `BudgetPool(...)` positionally to a single `invoke()` scopes the pool to that one invoke's own LLM calls and excludes any sub-invokes it nests.
+</Note>
+
+### Optional approaching-budget warning
+
+You can warn the agent to wrap up before the hard stop fires. Both `warn_cost_remaining` and `warning_text` must be supplied together:
+
+```python
+with BudgetPool(
+    cost_budget=1.00,
+    warn_cost_remaining=0.20,
+    warning_text="You are nearing the cost limit — start wrapping up now.",
+):
+    result = invoke(ReturnType(str), task="Complex task")
+```
+
+The warning text is emitted verbatim as a transient user message. No framing is added by the hook.
+
+### Parameters
+
+<ParamField path="cost_budget" type="float | None">
+  Hard ceiling on total LLM cost in USD. `None` means no cost limit. Must be positive when set.
+</ParamField>
+<ParamField path="calls_budget" type="int | None">
+  Hard ceiling on total LLM API calls. `None` means no call limit. Must be positive when set.
+</ParamField>
+<ParamField path="warn_cost_remaining" type="float | None">
+  Emit `warning_text` once the remaining cost budget falls to this many USD or fewer. Requires `cost_budget` and `warning_text`.
+</ParamField>
+<ParamField path="warn_calls_remaining" type="int | None">
+  Emit `warning_text` once the remaining calls budget falls to this many calls or fewer. Requires `calls_budget` and `warning_text`.
+</ParamField>
+<ParamField path="warning_text" type="str | None">
+  The text sent verbatim to the agent when an approaching-budget threshold is crossed. Must be paired with at least one `warn_*_remaining` argument.
+</ParamField>
+
+---
+
+## IterationLimit — per-level turn cap
+
+`IterationLimit` stops a single invoke once it has made `max_iterations` LLM turns. Iterations are zero-based, so `max_iterations=20` allows turns 0–19 and aborts on turn 20 with `IterationLimitExhaustedError`. Under `with` the cap applies to every nested invoke as well, each counting its own iterations independently.
+
+```python
+from jaz.hooks import IterationLimit
+
+with IterationLimit(max_iterations=20):
+    result = invoke(ReturnType(str), task="Complex task")
+```
+
+### Approaching-limit warning
+
+```python
+with IterationLimit(
+    max_iterations=20,
+    warn_remaining=3,
+    warning_text="You have 3 turns left — finish up and return your result.",
+):
+    result = invoke(ReturnType(str), task="Complex task")
+```
+
+### Depth window
+
+You can restrict which invokes the cap applies to using `min_depth` and `max_depth` (1-based, where the top-level invoke is depth 1):
+
+```python
+# Cap only sub-invokes (not the driver)
+with IterationLimit(max_iterations=10, min_depth=2):
+    result = invoke(ReturnType(str), task="Delegate work to sub-agents")
+```
+
+<Warning>
+`IterationLimit` with a depth window (`min_depth`/`max_depth`) can only be activated via `with`. Passing it positionally to `invoke()` raises `HookActivationError`.
+</Warning>
+
+---
+
+## RecursionLimit — cap on nesting depth
+
+By default, `jaz.invoke` recursion is **unbounded**. Models only recurse when a task explicitly calls for it, and the real runaway cost is bounded by `BudgetPool`. If you want an explicit depth cap, opt into `RecursionLimit`:
+
+```python
+from jaz.hooks import RecursionLimit, ReturnType
+
+with RecursionLimit(max_depth=3):
+    result = invoke(
+        ReturnType(list),
+        task="For each item, use jaz.invoke to process it. Combine and return the results.",
+        items=data,
+    )
+```
+
+`max_depth=3` means the top-level invoke is depth 1, its sub-invokes are depth 2, and their children are depth 3. An invoke at the cap level runs normally but is not given the `jaz.invoke` tool. Any invoke that enters past the cap is aborted with `RecursionLimitError`.
+
+<Warning>
+`RecursionLimit` **must** be activated via `with`. Passing it positionally to `invoke()` raises `HookActivationError`, because a positional hook does not propagate to nested invokes and therefore cannot cap the subtree.
+</Warning>
+
+---
+
+## BudgetForcing — refuse early finishes
+
+`BudgetForcing` refuses an agent's `return` or `raise` a configurable number of times, converting each refused finish into a recoverable error that prompts the agent to keep working. This is useful when you want the agent to think longer before committing to an answer.
+
+```python
+from jaz.hooks import BudgetForcing
+
+with BudgetForcing(refusals=2, refusal_text="Keep working — double-check before finishing."):
+    result = invoke(ReturnType(str), task="Analyze this dataset carefully")
+```
+
+After `refusals` refusals the next finish is allowed through. Each invoke in scope gets its own independent refusal budget.
+
+---
+
+## ContextWindowWarning — prompt-size nudge
+
+`ContextWindowWarning` warns the agent as its prompt approaches the model's context window limit. It fires a user message when the prompt nears the window ceiling, giving the agent a chance to summarize or prune before it is cut off.
+
+```python
+from jaz.hooks import ContextWindowWarning
+
+with ContextWindowWarning():
+    result = invoke(ReturnType(str), task="Analyze this large document")
+```
+
+---
+
+## Composing multiple hooks
+
+All budget-control hooks are context managers and compose freely:
+
+```python
+from jaz.hooks import BudgetPool, BudgetForcing, IterationLimit, RecursionLimit, ReturnType
+
+with (
+    BudgetPool(cost_budget=0.50, calls_budget=100),
+    IterationLimit(max_iterations=20),
+    RecursionLimit(max_depth=3),
+    BudgetForcing(refusals=1, refusal_text="Think more carefully before finishing."),
+):
+    result = invoke(
+        ReturnType(str),
+        task="Complex multi-step task",
+        data=my_data,
+    )
+```
+
+<Tip>
+For a list of hooks that must be applied at runtime, use `contextlib.ExitStack`:
+
+```python
+from contextlib import ExitStack
+from jaz.hooks import BudgetPool, IterationLimit
+
+hooks = [BudgetPool(cost_budget=1.0), IterationLimit(max_iterations=30)]
+
+with ExitStack() as stack:
+    for hook in hooks:
+        stack.enter_context(hook)
+    result = invoke(ReturnType(str), task="Task")
+```
+</Tip>
+
+---
+
+## Summary
+
+<Accordion title="Which hook does what?">
+
+| Hook | Controls | Scope |
+|------|----------|-------|
+| `BudgetPool(cost_budget=, calls_budget=)` | Total USD spent and API calls made | Shared across all invokes in the `with` block |
+| `IterationLimit(max_iterations=)` | LLM turns per single invoke | Each invoke counts independently |
+| `RecursionLimit(max_depth=)` | How deeply agents can call `jaz.invoke` | Whole subtree under the `with` block |
+| `BudgetForcing(refusals=, refusal_text=)` | Prevents early `return`/`raise` | Each invoke counts independently |
+| `ContextWindowWarning()` | Warns agent as context window fills | All invokes in scope |
+
+</Accordion>

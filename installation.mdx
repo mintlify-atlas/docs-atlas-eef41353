@@ -1,0 +1,212 @@
+---
+title: "Install JAZ and Configure API Keys"
+sidebarTitle: "Installation"
+description: "Install jaz-lang via pip or git, set up optional extras for tracing and Copilot, and configure provider API keys or GitHub Copilot authentication."
+---
+
+JAZ is distributed as `jaz-lang` on PyPI. The package name and the import name differ — you install `jaz-lang` but write `import jaz` in your code. This page covers requirements, install options, optional extras, and every supported method for supplying API credentials.
+
+## Requirements
+
+JAZ requires **Python 3.12 or later**. Two features need Python 3.14:
+
+- **T-string prompt syntax** — `invoke(task=t"Analyze the {data}")` uses [PEP 750](https://peps.python.org/pep-0750/) template strings, which are only available on Python 3.14+.
+- **The `jaz` console** — the interactive REPL (`jaz` on the command line) requires Python 3.14+ to run.
+
+Everything else — `invoke`, `ainvoke`, all hooks, all configuration — works on 3.12 and 3.13. The equivalent keyword form `invoke(task="Analyze the data", data=data)` works on every supported version.
+
+## Install
+
+<CodeGroup>
+
+```bash pip (latest stable)
+pip install jaz-lang
+```
+
+```bash git (specific pre-release)
+pip install "jaz-lang @ git+https://github.com/jaz-lang/jaz.git@v0.2.0a4"
+```
+
+</CodeGroup>
+
+Use the git form to pin a specific pre-release tag or to install a version that has not yet reached PyPI.
+
+Verify your install:
+
+```python
+import jaz
+print(jaz.__version__)  # e.g. 0.2.0a4
+```
+
+## Optional Extras
+
+JAZ ships three optional dependency groups. Install them by appending the extra name in brackets:
+
+<Accordion title="jaz-lang[tracing] — OpenTelemetry support">
+  Adds OpenTelemetry API, SDK, and the OTLP HTTP exporter. Required for the built-in `JaegerTracing` and `LangfuseTracing` hooks.
+
+  ```bash
+  pip install "jaz-lang[tracing]"
+  ```
+
+  Once installed, enable tracing with:
+
+  ```python
+  from jaz import invoke
+  from jaz.hooks import LangfuseTracing, ReturnType
+
+  with LangfuseTracing():
+      result = invoke(ReturnType(int), task="Calculate 2 + 2")
+  ```
+
+  Required environment variables for Langfuse:
+  - `LANGFUSE_PUBLIC_KEY`
+  - `LANGFUSE_SECRET_KEY`
+  - `LANGFUSE_HOST` (optional — defaults to `https://cloud.langfuse.com`)
+</Accordion>
+
+<Accordion title="jaz-lang[copilot] — GitHub Copilot backend">
+  Adds the `github-copilot-sdk` dependency, which lets JAZ use your Copilot subscription's GitHub AI credits instead of a provider API key.
+
+  ```bash
+  pip install "jaz-lang[copilot]"
+  ```
+
+  See the [Copilot authentication section](#api-keys) below for setup instructions.
+</Accordion>
+
+<Accordion title="jaz-lang[tokens] — Transformers token counting">
+  Adds `transformers` for accurate token counting on models not covered by LiteLLM's built-in tokenizer table. Only needed for advanced budget or context-window hooks that require exact token counts.
+
+  ```bash
+  pip install "jaz-lang[tokens]"
+  ```
+</Accordion>
+
+## API Keys
+
+JAZ reads provider credentials from the environment using each provider's standard variable name. There is no JAZ-specific key format — set the same variable the provider's own SDK expects.
+
+<Tabs>
+  <Tab title="OpenAI (and other providers)">
+    **Shell profile** — the simplest option; the key is available in every terminal session:
+
+    ```bash
+    # Add to ~/.zshrc or ~/.bashrc
+    export OPENAI_API_KEY="sk-..."
+    ```
+
+    **`.env` file** — keeps secrets out of version control. Create a `.env` at the project root, then load it automatically with [direnv](https://direnv.net/):
+
+    ```bash
+    # .env  (add to .gitignore)
+    OPENAI_API_KEY=sk-...
+    ```
+
+    ```bash
+    # .envrc  (direnv auto-loads this on `cd`)
+    dotenv
+    ```
+
+    Install direnv with `brew install direnv` (macOS) or your system package manager, then run `direnv allow` once in the project directory.
+
+    **Other providers** follow the same pattern with their own variable names — for example, `ANTHROPIC_API_KEY` for Anthropic or `GEMINI_API_KEY` for Google Gemini. LiteLLM's documentation lists the exact variable for every supported provider.
+
+    Once your key is set, select the model you want via `jaz.configure`:
+
+    ```python
+    import jaz
+    from jaz.llm import LiteLLM
+
+    # OpenAI
+    jaz.configure(llm=LiteLLM(model="openai/gpt-4o"))
+
+    # Anthropic
+    jaz.configure(llm=LiteLLM(model="anthropic/claude-opus-4"))
+
+    # Local OpenAI-compatible server (Ollama, vLLM, LM Studio, …)
+    jaz.configure(
+        llm=LiteLLM(
+            model="openai/llama3",
+            api_base="http://localhost:11434/v1",
+            api_key="dummy",  # required by the openai/ route; a dummy value is fine for local servers
+        )
+    )
+    ```
+  </Tab>
+  <Tab title="GitHub Copilot">
+    The Copilot backend requires the `copilot` extra and bills your Copilot subscription's GitHub AI credits. No provider API key is needed.
+
+    **Step 1 — install the extra:**
+
+    ```bash
+    pip install "jaz-lang[copilot]"
+    ```
+
+    **Step 2 — authenticate.** Choose one method:
+
+    ```bash
+    # Option A: GitHub CLI (recommended for interactive use)
+    gh auth login
+
+    # Option B: set a token in the environment
+    export COPILOT_GITHUB_TOKEN="ghp_..."
+    # Also accepted: GH_TOKEN or GITHUB_TOKEN (checked in that order)
+    ```
+
+    An explicit environment token takes precedence over the CLI login. The lookup order is:
+
+    1. `COPILOT_GITHUB_TOKEN`
+    2. `GH_TOKEN`
+    3. `GITHUB_TOKEN`
+    4. Signed-in `gh`/`copilot` CLI
+
+    **Step 3 — configure JAZ:**
+
+    ```python
+    import jaz
+    from jaz.llm import CopilotLLM
+
+    # Copilot model IDs are unprefixed (no "openai/" prefix)
+    jaz.configure(llm=CopilotLLM(model="gpt-4o"))
+    ```
+
+    <Warning>
+    `CopilotLLM` sits outside the stable API surface. Its constructor and model ID format may change between releases. For production workloads that need stability guarantees, use `LiteLLM` with an explicit provider API key instead.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## The `jaz` Console
+
+Installing `jaz-lang` also puts a `jaz` command on your `PATH` (requires Python ≥ 3.14). It is a persistent Python REPL with conversational shortcuts layered on top — variables survive across lines, `_` holds the last result, and special sigils let you invoke the agent inline:
+
+```text
+> what is 2 + 2?
+n: int <- how many days in a leap year?
+?n
+% switch to gpt-4o-mini
+import math
+```
+
+A session with no model configured opens a setup wizard on first run: pick a provider, paste its key, or choose **GitHub Copilot** for keyless access. The choice is validated with one live request, then saved to `~/.jaz/settings.json`. Provider API keys entered in the wizard go to `~/.jaz/credentials.json`.
+
+Flags configure a single session without changing the saved defaults:
+
+```bash
+jaz --backend copilot --model gpt-4o-mini
+jaz --max-cost 0.50
+jaz --log run.log
+jaz -c "What is the capital of France?"  # run one prompt and exit
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write your first agent in five minutes — from a simple integer result to tools and nested sub-agents.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/concepts/configuration">
+    Switching LLM backends, adjusting REPL timeouts, and scoping overrides to a single invoke call.
+  </Card>
+</CardGroup>

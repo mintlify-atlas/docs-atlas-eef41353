@@ -1,0 +1,148 @@
+{
+  "projectType": "framework",
+  "projectName": "JAZ",
+  "projectDescription": "A minimalist Python framework for building object-oriented LLM agents that execute in a REPL loop — combining deterministic code with LLM reasoning through an extensible hook system.",
+  "theme": "luma",
+  "primaryColor": "#0f172a",
+  "lightColor": "#4e9dfa",
+  "darkColor": "#fa5d5f",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/agent-loop",
+              "concepts/tools-and-inputs",
+              "concepts/hooks",
+              "concepts/configuration"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/budget-control",
+              "guides/custom-hooks",
+              "guides/llm-backends",
+              "guides/tracing",
+              "guides/async",
+              "guides/console"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/invoke",
+              "api/configure",
+              "api/scope",
+              "api/describe"
+            ]
+          },
+          {
+            "group": "Hooks",
+            "pages": [
+              "api/hooks/overview",
+              "api/hooks/builtin",
+              "api/hooks/events",
+              "api/hooks/effects"
+            ]
+          },
+          {
+            "group": "LLM Backends",
+            "pages": [
+              "api/llm/overview",
+              "api/llm/litellm",
+              "api/llm/custom-backend"
+            ]
+          },
+          {
+            "group": "REPL & Protocol",
+            "pages": [
+              "api/repl",
+              "api/protocol",
+              "api/exceptions"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "REPL-based agent loop: LLM writes Python code, observes results, and iterates until task completion",
+    "Recursive agent composition with automatic cost tracking and propagating context",
+    "Tools as plain Python functions — signature and docstring become the agent's description",
+    "Extensible hook system using typed events (InvokeEnter, LLMQueryEnter, REPLExecEnter) and effects",
+    "Built-in hooks for budget control, iteration/recursion limits, logging, tracing, and replay",
+    "LiteLLM default backend routing to every major provider (OpenAI, Anthropic, Gemini, Bedrock, ...)",
+    "Custom LLM backends via BaseLLM subclass; local OpenAI-compatible servers with zero code",
+    "jaz.scope for ambient inputs that propagate through nested invoke trees without manual threading",
+    "jaz.describe to attach prompt descriptions to values that travel into nested invokes",
+    "Interactive jaz console REPL with Python 3.14 t-string support",
+    "Trajectory recording and replay via ATIF format; Langfuse/Jaeger/OTel tracing presets",
+    "Async support via ainvoke for top-level await in agent code"
+  ],
+  "publicApiSurface": [
+    "jaz.invoke(*hooks, **inputs) -> object",
+    "jaz.ainvoke(*hooks, **inputs) -> object",
+    "jaz.configure(*, llm, repl, protocol)",
+    "jaz.ConfigOverride(*, llm, repl, protocol)",
+    "jaz.get_config() -> Config",
+    "jaz.scope(**values) -> ContextManager",
+    "jaz.describe(value, description) -> value",
+    "jaz.add_template_loader(loader)",
+    "jaz.hooks.Hook (base class)",
+    "jaz.hooks.ReturnType[T]",
+    "jaz.hooks.ValidateReturn",
+    "jaz.hooks.ValidateREPLCode",
+    "jaz.hooks.BudgetPool(cost_budget, calls_budget)",
+    "jaz.hooks.IterationLimit(max_iterations)",
+    "jaz.hooks.RecursionLimit(max_depth)",
+    "jaz.hooks.BudgetForcing",
+    "jaz.hooks.ContextWindowWarning",
+    "jaz.hooks.PrintLogger",
+    "jaz.hooks.FileLogger(path)",
+    "jaz.hooks.TrajectoryRecorder",
+    "jaz.hooks.TrajectoryDirectoryRecorder",
+    "jaz.hooks.TrajectoryReplay",
+    "jaz.hooks.RolloutRecorder",
+    "jaz.hooks.LangfuseTracing",
+    "jaz.hooks.JaegerTracing",
+    "jaz.hooks.OTelTracing",
+    "jaz.hooks.events.InvokeEnter / InvokeSend / InvokeComplete / InvokeExit",
+    "jaz.hooks.events.LLMQueryEnter / LLMQuerySend / LLMQueryComplete / LLMQueryExit / LLMQueryRetry",
+    "jaz.hooks.events.REPLExecEnter / REPLExecSend / REPLExecComplete / REPLExecExit",
+    "jaz.hooks.events.Completed / Aborted / Failed",
+    "jaz.hooks.effects.AddMessages / DropMessages",
+    "jaz.hooks.effects.AddInputs / DropInputs",
+    "jaz.hooks.effects.AddVariables / DropVariables",
+    "jaz.hooks.effects.SupplyLLMResponse / ModifyLLMResponse",
+    "jaz.hooks.effects.SupplyExecResult / ModifyExecResult",
+    "jaz.hooks.effects.Abort",
+    "jaz.hooks.effects.DisableRecursion",
+    "jaz.hooks.effects.BlackboardWrite",
+    "jaz.llm.BaseLLM (base class)",
+    "jaz.llm.LiteLLM(model, ...)",
+    "jaz.llm.CompletionResponse / Usage / Choice / Message",
+    "jaz.repl.BaseREPL (base class)",
+    "jaz.repl.PythonREPL(exec_timeout, exec_memory_limit, allowed_imports, ...)",
+    "jaz.protocol.BaseProtocol (base class)",
+    "jaz.protocol.CodeOnlyProtocol(max_invoke_input_length, max_repl_output_length, ...)",
+    "jaz.credentials.resolve_credential(tag)",
+    "jaz.exceptions.JAZError (base exception hierarchy)"
+  ]
+}

@@ -1,0 +1,258 @@
+---
+title: "Writing Custom Hooks for JAZ Agents"
+sidebarTitle: "Custom Hooks"
+description: "Subclass jaz.hooks.Hook, handle typed events, and return effects to observe or influence every aspect of a running JAZ agent."
+---
+
+Hooks are the primary extension point in JAZ. A hook observes the agent's execution by receiving typed events and can influence it by returning typed effects — the only way a hook changes anything. The framework ships many built-in hooks, but you can write your own by subclassing `jaz.hooks.Hook`.
+
+## The Hook base class
+
+Subclass `Hook` and override one or more of its per-event methods. No `isinstance` dispatch or `match` statements are needed — the framework routes each event to the right method automatically.
+
+```python
+from jaz import invoke
+from jaz.hooks import Hook
+from jaz.hooks.effects import AddMessages, Effect
+from jaz.hooks.events import LLMQueryEnter
+
+class ConciseHook(Hook):
+    """Instruct the agent to be concise after iteration 3."""
+
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        if event.iteration >= 3:  # iterations are 0-based
+            return [AddMessages([{"role": "user", "content": "Be concise."}])]
+        return []
+
+# Activate with `with` so the hook propagates to nested invokes
+with ConciseHook():
+    result = invoke(task="Solve this step by step")
+```
+
+## Available event handlers
+
+Override any of the typed methods on `Hook`. Each method receives the corresponding event object and returns a `list[Effect]`. Returning `[]` makes the hook a pure observer.
+
+<Accordion title="Invoke span">
+
+| Method | Event | Fires when |
+|--------|-------|------------|
+| `on_invoke_enter` | `InvokeEnter` | An invoke is starting, before any LLM query |
+| `on_invoke_send` | `InvokeSend` | The invoke's inputs have committed (post add/drop) |
+| `on_invoke_complete` | `InvokeComplete` | The invoke's raw terminal result exists (transform boundary) |
+| `on_invoke_exit` | `InvokeExit` | The invoke's span has closed (observation-only) |
+
+</Accordion>
+
+<Accordion title="LLM query span">
+
+| Method | Event | Fires when |
+|--------|-------|------------|
+| `on_llm_query_enter` | `LLMQueryEnter` | An LLM query is about to be issued |
+| `on_llm_query_send` | `LLMQuerySend` | The query's post-edit message list has committed |
+| `on_llm_query_complete` | `LLMQueryComplete` | The raw LLM response exists (response transform boundary) |
+| `on_llm_query_exit` | `LLMQueryExit` | The LLM query span has closed |
+| `on_llm_query_retry` | `LLMQueryRetry` | An LLM call is being retried after a failure |
+
+</Accordion>
+
+<Accordion title="REPL execution span">
+
+| Method | Event | Fires when |
+|--------|-------|------------|
+| `on_repl_exec_enter` | `REPLExecEnter` | REPL code is about to execute |
+| `on_repl_exec_send` | `REPLExecSend` | Execution's code has committed (namespace deltas applied) |
+| `on_repl_exec_complete` | `REPLExecComplete` | The execution's raw result exists (transform boundary) |
+| `on_repl_exec_exit` | `REPLExecExit` | The REPL execution span has closed |
+
+</Accordion>
+
+### Cross-cutting observers with `on_any`
+
+For a hook that treats every event the same way — logging, tracing — override `on_any` instead. It fires **in addition to** any typed handler on the same instance, so you can use both at once.
+
+```python
+from jaz.hooks import Hook
+from jaz.hooks.base import Event
+from jaz.hooks.effects import Effect
+
+class EventCounter(Hook):
+    def __init__(self):
+        self.count = 0
+
+    def on_any(self, event: Event) -> list[Effect]:
+        self.count += 1
+        return []
+```
+
+## Effects reference
+
+Effects are what handlers return to influence execution. Import them from `jaz.hooks.effects`.
+
+<Accordion title="InvokeEnter effects">
+
+| Effect | Description |
+|--------|-------------|
+| `AddInputs(inputs)` | Add name→value pairs to the invoke, rendering in the prompt and binding in the REPL |
+| `DropInputs(keys)` | Un-pass invoke inputs by name |
+| `DisableRecursion()` | Withhold the `jaz.invoke` tool from this invoke |
+| `Abort(error=exc)` | Abort the invoke; `exc` propagates out of `jaz.invoke()` |
+
+</Accordion>
+
+<Accordion title="LLMQueryEnter effects">
+
+| Effect | Description |
+|--------|-------------|
+| `AddMessages(messages, persistent=False)` | Insert messages into the conversation before the LLM query |
+| `DropMessages(indices)` | Drop messages by index from the list sent to the model |
+| `Abort(error=exc)` | Abort the invoke before the LLM call is made |
+
+</Accordion>
+
+<Accordion title="REPLExecEnter effects">
+
+| Effect | Description |
+|--------|-------------|
+| `AddVariables(variables)` | Bind names into the REPL namespace for this turn |
+| `DropVariables(names)` | Remove names from the REPL namespace for this turn |
+| `InsertCode(text, at)` | Insert source into the proposed code |
+| `DeleteCode(start, end)` | Delete a character range from the proposed code |
+| `Abort(error=exc)` | Abort before the code executes |
+
+</Accordion>
+
+<Accordion title="Supply and transform effects">
+
+| Effect | Stage | Description |
+|--------|-------|-------------|
+| `SupplyLLMResponse(content, ...)` | `LLMQuerySend` | Supply a pre-computed LLM response, skipping the API call |
+| `SupplyExecResult(result)` | `REPLExecSend` | Supply a result, skipping REPL execution |
+| `SupplyInvokeResult(result)` | `InvokeSend` | Supply an invoke result, skipping the whole agent loop |
+| `ModifyLLMResponse(content=..., cost_usd=...)` | `LLMQueryComplete` | Transform the LLM response |
+| `ModifyExecResult(result)` | `REPLExecComplete` | Replace the execution result |
+| `ModifyInvokeResult(result)` | `InvokeComplete` | Replace the invoke's terminal result |
+
+</Accordion>
+
+<Accordion title="Cross-cutting effects">
+
+| Effect | Description |
+|--------|-------------|
+| `BlackboardWrite(key, value)` | Write to the per-invoke cross-hook blackboard; valid at any event |
+| `Abort(error=exc)` | Valid at every `*Enter`, `*Send`, `*Complete`, and per-turn `*Exit` event |
+
+</Accordion>
+
+## Example: custom token counter
+
+Here is a hook that counts total tokens across every LLM call in its scope:
+
+```python
+from jaz import invoke
+from jaz.hooks import Hook
+from jaz.hooks.effects import Effect
+from jaz.hooks.events import LLMQueryExit
+from jaz.hooks.events.base import Completed
+
+class TokenCounter(Hook):
+    def __init__(self):
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+
+    def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
+        if not isinstance(event.outcome, Completed):
+            return []
+        response = event.outcome.result
+        if response.prompt_tokens is not None:
+            self.total_prompt_tokens += response.prompt_tokens
+        if response.completion_tokens is not None:
+            self.total_completion_tokens += response.completion_tokens
+        return []
+
+counter = TokenCounter()
+with counter:
+    result = invoke(task="Summarize this document", text=doc)
+
+print(f"Used {counter.total_prompt_tokens} prompt tokens, "
+      f"{counter.total_completion_tokens} completion tokens")
+```
+
+## Hook activation: `with` vs positional
+
+There are two ways to activate a hook, and **they differ in propagation**:
+
+<Tabs>
+  <Tab title="with (propagating)">
+    The hook is active for the invoke **and every nested invoke inside it**.
+
+    ```python
+    with MyHook():
+        invoke(...)  # MyHook sees this AND every nested jaz.invoke
+    ```
+  </Tab>
+  <Tab title="Positional (one invoke only)">
+    The hook applies only to that single invoke. Nested invokes do **not** see it.
+
+    ```python
+    invoke(MyHook(), task=...)  # MyHook sees ONLY this invoke's events
+    ```
+  </Tab>
+</Tabs>
+
+Use `with` when you need the hook to observe or govern the full invoke tree (logging, budget enforcement, tracing). Use positional activation when you want to scope the hook to a single call.
+
+## Lifecycle methods: `setup` and `teardown`
+
+Override `setup()` to acquire resources (open files, start connections) and `teardown(exc)` to release them. `exc` is the exception that propagated out of the scope, or `None` on clean exit.
+
+```python
+class FileLogger(Hook):
+    def setup(self) -> None:
+        self._file = open("agent.log", "w")
+
+    def teardown(self, exc=None) -> None:
+        self._file.flush()
+        self._file.close()
+
+    def on_invoke_enter(self, event) -> list:
+        self._file.write(f"invoke started: {dict(event.inputs)}\n")
+        return []
+```
+
+If reusing the same instance across multiple activations is unsafe (e.g., the hook writes a file it would overwrite), call `self.forbid_reactivation()` inside `setup()` to raise on the second activation.
+
+## Cross-hook coordination with `BlackboardWrite`
+
+Hooks can share data within a single invoke using the blackboard. A write made at one event is visible to all hooks from the next event onward:
+
+```python
+from jaz.hooks.effects import BlackboardWrite, Effect
+from jaz.hooks.events import LLMQueryEnter, LLMQueryExit
+from jaz.hooks.events.base import Completed
+
+class CostPublisher(Hook):
+    def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
+        if isinstance(event.outcome, Completed):
+            cost = event.outcome.result.cost_usd or 0.0
+            return [BlackboardWrite(key="last_call_cost", value=cost)]
+        return []
+
+class CostReader(Hook):
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        last_cost = event.blackboard.get("last_call_cost")
+        if last_cost is not None:
+            print(f"[turn {event.iteration}] previous call cost ${last_cost:.4f}")
+        return []
+```
+
+## Composing hooks
+
+Multiple hooks stack naturally:
+
+```python
+with ConciseHook(), TokenCounter(), FileLogger("agent.log"):
+    result = invoke(task="Write a report")
+```
+
+Effects from all active hooks are collected and applied together after each event. Order-independent effects (like `AddMessages` and `DropMessages`) compose without conflict. Two hooks emitting contradictory effects (like two different `Return` values) raise a conflict error.

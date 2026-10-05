@@ -1,0 +1,511 @@
+---
+title: "Built-in JAZ Hooks Reference"
+sidebarTitle: "Built-in Hooks"
+description: "Complete reference for all JAZ built-in hooks: limits, budgets, return contracts, logging, trajectory recording, replay, and tracing presets."
+---
+
+JAZ ships a set of ready-made "battery" hooks that cover the most common agent governance and observability needs. All built-in hooks are importable directly from `jaz.hooks`. Before writing your own, check whether one of these already does what you need.
+
+<Note>
+The hook system is **experimental**. Hook interfaces may change in a future release.
+</Note>
+
+## Return and validation
+
+<Accordion title="ReturnType[T]">
+
+**Purpose:** Declare the expected return type for an invoke. The agent is told the type via a persistent prompt block, each wrong-typed `return` is shown back as a recoverable error, and the correct type is enforced — a wrong-typed value never escapes to the caller.
+
+**Constructor parameters:**
+
+<ParamField path="return_type" type="TypeForm[T] | None" required>
+  The expected return type. Any type annotation works: `None`, `str`, `list`, `dict[str, int]`, etc. Validated at construction — an unusable hint raises `TypeError` immediately rather than failing mid-run.
+</ParamField>
+
+<ParamField path="max_failures" type="int | None" default="None">
+  How many wrong-typed returns the agent may recover from before the next one ends the invoke. `0` aborts on the first wrong type; `None` (default) never escalates — the agent retries until it returns the right type or hits another limit.
+</ParamField>
+
+**Events handled:** `LLMQueryEnter` (injects the `<return_type>` prompt block on the first turn as a persistent message), `REPLExecComplete` (per-turn type check — downgrades wrong-typed `Return` to `Continue`), `InvokeComplete` (terminal backstop — downgrades still-wrong `Return` to `Raise`), `InvokeExit` (cleanup).
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+# Passed as the first positional arg — also narrows the static return type to str.
+result: str = invoke(ReturnType(str), task="Return a greeting.")
+
+# Under `with`, the same type is enforced on every invoke in scope.
+with ReturnType(list[int]):
+    result = invoke(task="Return a list of numbers.")
+```
+
+</Accordion>
+
+<Accordion title="ValidateReturn">
+
+**Purpose:** Run a custom predicate on the agent's `return` value. A rejected value is shown as a recoverable error so the agent can correct itself; after `max_failures` rejections the invoke ends by raising the validator's exception.
+
+**Constructor parameters:**
+
+<ParamField path="validator" type="Callable[[T], None]" required>
+  Called with the return value. Raise to reject (any exception); return normally to accept. The raised exception is shown to the agent and, at the cap, propagates out of `invoke()` unchanged — include the offending value in the message if the caller needs it.
+</ParamField>
+
+<ParamField path="max_failures" type="int | None" default="None">
+  Rejections the agent may recover from before the next one ends the invoke. `None` (default) never escalates.
+</ParamField>
+
+**Events handled:** `REPLExecComplete`, `InvokeComplete` (backstop), `InvokeExit` (cleanup).
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import ValidateReturn
+
+def must_be_positive(value):
+    if value <= 0:
+        raise ValueError(f"Expected a positive number, got {value!r}")
+
+result = invoke(ValidateReturn(must_be_positive), task="Return a positive integer.")
+```
+
+</Accordion>
+
+<Accordion title="ValidateREPLCode">
+
+**Purpose:** Inspect each turn's proposed REPL code before it runs. A rejected turn is returned to the agent as a recoverable `Continue`; after `max_failures` rejections the invoke ends with `Abort`.
+
+**Events handled:** `REPLExecSend` (inspection at the committed-code boundary).
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import ValidateREPLCode
+
+def no_file_writes(code: str) -> None:
+    if "open(" in code and "w" in code:
+        raise ValueError("File writes are not permitted.")
+
+result = invoke(ValidateREPLCode(no_file_writes, max_failures=3), task="...")
+```
+
+</Accordion>
+
+## Limits
+
+<Accordion title="IterationLimit(max_iterations)">
+
+**Purpose:** Hard-stop the agent after `max_iterations` REPL turns. Iterations are 0-based, so the agent runs turns `0` through `max_iterations - 1` and is aborted on reaching `max_iterations`. An optional approaching-limit warning can nudge the agent to finish.
+
+**Constructor parameters:**
+
+<ParamField path="max_iterations" type="int" required>
+  Maximum number of turns. Must be `>= 1`.
+</ParamField>
+
+<ParamField path="warning_text" type="str | None" default="None">
+  Text emitted verbatim as a transient user message once the agent is within `warn_remaining` turns of the cap. Must be paired with `warn_remaining`.
+</ParamField>
+
+<ParamField path="warn_remaining" type="int | None" default="None">
+  Warn once this many turns or fewer remain. An absolute count, not a fraction. Must be paired with `warning_text`.
+</ParamField>
+
+<ParamField path="min_depth" type="int | None" default="None">
+  Only apply to invokes at this depth or deeper (1-based). Requires the `with` activation path — raises `HookActivationError` if installed via positional arg.
+</ParamField>
+
+<ParamField path="max_depth" type="int | None" default="None">
+  Only apply to invokes at this depth or shallower.
+</ParamField>
+
+**Events handled:** `LLMQueryEnter` (hard stop and warning — the always-present per-turn boundary).
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import IterationLimit
+
+with IterationLimit(
+    50,
+    warning_text="You are running low on turns. Wrap up soon.",
+    warn_remaining=5,
+):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="RecursionLimit(max_depth)">
+
+**Purpose:** Cap the nesting depth of `jaz.invoke` calls. At the cap depth the agent is given no `invoke` tool (affordance removal); an invoke that somehow enters past the cap is aborted with `RecursionLimitError`.
+
+**Constructor parameters:**
+
+<ParamField path="max_depth" type="int" required>
+  Deepest allowed invoke depth, 1-based. `max_depth=1` allows a top-level invoke and no sub-invokes.
+</ParamField>
+
+**Activation restriction:** Must be installed via `with RecursionLimit(max_depth=N):`. Passing it positionally raises `HookActivationError` — a positional hook does not reach nested invokes and therefore cannot cap them.
+
+**Events handled:** `InvokeEnter` (emits `DisableRecursion` at the cap leaf; emits `Abort` for over-cap children).
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import RecursionLimit
+
+with RecursionLimit(max_depth=3):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+## Budget
+
+<Accordion title="BudgetPool(cost_budget, calls_budget)">
+
+**Purpose:** Enforce a shared LLM cost and/or call-count budget over everything in scope. Every invoke that the hook is active for draws on the same pool. Reaching the budget is a hard stop (raises `BudgetPoolExhaustedError`); an optional approaching-budget warning can nudge the agent to finish.
+
+**Constructor parameters:**
+
+<ParamField path="cost_budget" type="float | None" default="None">
+  Hard ceiling on total LLM cost in USD. Must be positive.
+</ParamField>
+
+<ParamField path="calls_budget" type="int | None" default="None">
+  Hard ceiling on total LLM calls. Must be positive.
+</ParamField>
+
+<ParamField path="warn_cost_remaining" type="float | None" default="None">
+  Warn once the remaining cost budget falls to this many USD or fewer. Requires `cost_budget` and `warning_text`.
+</ParamField>
+
+<ParamField path="warn_calls_remaining" type="int | None" default="None">
+  Warn once the remaining calls budget falls to this count or fewer. Requires `calls_budget` and `warning_text`.
+</ParamField>
+
+<ParamField path="warning_text" type="str | None" default="None">
+  The warning text, used verbatim. Must be paired with at least one `warn_*_remaining` threshold.
+</ParamField>
+
+**Events handled:** `LLMQueryEnter` (pre-flight uncosted-model check + hard-stop + warning), `LLMQueryExit` (cost/call accounting + uncosted-model backstop on the Completed arm).
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import BudgetPool
+
+# Cap the entire workflow at $2.00 total.
+with BudgetPool(
+    cost_budget=2.0,
+    warn_cost_remaining=0.25,
+    warning_text="Budget running low. Please return a result now.",
+):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="BudgetForcing">
+
+**Purpose:** Refuse early `return` statements, forcing the agent to use more of its allotted turns. Downgrades a `Return` at `REPLExecComplete` to a recoverable `Continue` unless the agent is near the iteration cap.
+
+**Events handled:** `LLMQueryEnter`, `REPLExecComplete`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import BudgetForcing, IterationLimit
+
+with IterationLimit(20), BudgetForcing():
+    result = invoke(task="Explore thoroughly before returning.")
+```
+
+</Accordion>
+
+<Accordion title="ContextWindowWarning">
+
+**Purpose:** Warn the agent as the prompt approaches the model's context window. Adds a user message once the buffer exceeds a configurable fraction of the context limit.
+
+**Events handled:** `LLMQueryEnter`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import ContextWindowWarning
+
+with ContextWindowWarning():
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+## Logging
+
+<Accordion title="PrintLogger">
+
+**Purpose:** Log every event to the terminal with ANSI colors. A pure observer — emits no effects, never influences the run.
+
+**Constructor parameters:**
+
+<ParamField path="level" type="int" default="logging.INFO">
+  Python logging level for emitted records.
+</ParamField>
+
+<ParamField path="max_field_length" type="int" default="1000">
+  Truncate any rendered field longer than this. `None` disables truncation.
+</ParamField>
+
+**Events handled:** All events via `on_any`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import PrintLogger
+
+with PrintLogger():
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="FileLogger(path)">
+
+**Purpose:** Log every event to a file, in the same format as `PrintLogger` but without colors. Opens the file on activation and closes it on teardown.
+
+**Constructor parameters:**
+
+<ParamField path="file_path" type="str | Path" required>
+  Destination file path. Parent directories are created automatically.
+</ParamField>
+
+<ParamField path="level" type="int" default="logging.INFO">
+  Python logging level.
+</ParamField>
+
+<ParamField path="max_field_length" type="int" default="1000">
+  Truncate rendered fields longer than this. `None` disables truncation.
+</ParamField>
+
+**Events handled:** All events via `on_any`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import FileLogger
+
+with FileLogger("run.log"):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+## Trajectory recording and replay
+
+<Accordion title="TrajectoryRecorder">
+
+**Purpose:** Write the run as an ATIF (Agent Trajectory Interchange Format) trajectory JSON — the canonical trace/replay/cost source. Suitable for resuming runs, computing cost breakdowns, and feeding eval tooling.
+
+**Constructor parameters:**
+
+<ParamField path="output_path" type="str | Path | None" default="None">
+  Destination file. When `None`, the trajectory is held in memory and readable via `get_trajectories()` after the scope ends.
+</ParamField>
+
+**Events handled:** `InvokeEnter`, `InvokeSend`, `InvokeExit`, `LLMQueryEnter`, `LLMQuerySend`, `LLMQueryExit`, `LLMQueryRetry`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import TrajectoryRecorder
+
+with TrajectoryRecorder(output_path="trace.atif.json"):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="TrajectoryDirectoryRecorder">
+
+**Purpose:** Write a browsable Markdown directory of the run, updated live turn-by-turn. Useful for human inspection during long runs.
+
+**Events handled:** Same span events as `TrajectoryRecorder`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import TrajectoryDirectoryRecorder
+
+with TrajectoryDirectoryRecorder("./run_output/"):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="TrajectoryReplay">
+
+**Purpose:** Resume a run from an ATIF trace, replaying the recorded LLM responses instead of making live API calls. The replay hook supplies `SupplyLLMResponse` at `LLMQuerySend` for each turn.
+
+**Constructor parameters:**
+
+<ParamField path="trajectory_path" type="str | Path" required>
+  Path to the `.atif.json` trace file to replay from.
+</ParamField>
+
+**Events handled:** `LLMQuerySend` (supplies recorded responses).
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import TrajectoryReplay
+
+with TrajectoryReplay("trace.atif.json"):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="RolloutRecorder">
+
+**Purpose:** Record token-native rollouts for training data, suitable for fine-tuning workflows on token-native LLM backends.
+
+**Events handled:** `InvokeEnter`, `InvokeExit`, `LLMQueryEnter`, `LLMQueryExit`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import RolloutRecorder
+
+recorder = RolloutRecorder()
+with recorder:
+    result = invoke(task="...")
+
+rollouts = recorder.get_rollouts()
+```
+
+</Accordion>
+
+## Tracing (requires `jaz-lang[tracing]`)
+
+The tracing hooks require the optional OpenTelemetry dependencies. Install with:
+
+```bash
+pip install "jaz-lang[tracing]"
+```
+
+<Accordion title="LangfuseTracing">
+
+**Purpose:** Export JAZ traces to Langfuse Cloud via OpenTelemetry OTLP HTTP.
+
+**Constructor parameters:**
+
+<ParamField path="public_key" type="str | None" default="None">
+  Langfuse public key. Falls back to `LANGFUSE_PUBLIC_KEY` environment variable.
+</ParamField>
+
+<ParamField path="secret_key" type="str | None" default="None">
+  Langfuse secret key. Falls back to `LANGFUSE_SECRET_KEY` environment variable.
+</ParamField>
+
+<ParamField path="base_url" type="str | None" default="None">
+  Langfuse base URL. Falls back to `LANGFUSE_HOST` / `LANGFUSE_BASE_URL` env vars, or `https://cloud.langfuse.com`.
+</ParamField>
+
+<ParamField path="service_name" type="str" default='"jaz-agent"'>
+  OpenTelemetry service name attribute.
+</ParamField>
+
+<ParamField path="max_attribute_length" type="int | None" default="None">
+  Maximum string attribute length. `None` applies no truncation.
+</ParamField>
+
+**Usage:**
+
+```python
+import os
+from jaz import invoke
+from jaz.hooks import LangfuseTracing
+
+os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-..."
+os.environ["LANGFUSE_SECRET_KEY"] = "sk-..."
+
+with LangfuseTracing():
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="JaegerTracing">
+
+**Purpose:** Export JAZ traces to a Jaeger instance via OpenTelemetry OTLP. A preset subclass of `OTelTracing`.
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import JaegerTracing
+
+with JaegerTracing(endpoint="http://localhost:4318/v1/traces"):
+    result = invoke(task="...")
+```
+
+</Accordion>
+
+<Accordion title="OTelTracing (base class)">
+
+**Purpose:** Base class for custom OpenTelemetry OTLP exporters. Subclass this to export to any OTLP-compatible collector.
+
+**Constructor parameters:**
+
+<ParamField path="endpoint" type="str" required>
+  OTLP HTTP endpoint URL (e.g. `http://collector:4318/v1/traces`).
+</ParamField>
+
+<ParamField path="service_name" type="str" default='"jaz-agent"'>
+  OpenTelemetry service name attribute.
+</ParamField>
+
+<ParamField path="headers" type="dict[str, str] | None" default="None">
+  Additional HTTP headers to send with each export request.
+</ParamField>
+
+<ParamField path="max_attribute_length" type="int | None" default="None">
+  Maximum string attribute length.
+</ParamField>
+
+**Usage:**
+
+```python
+from jaz import invoke
+from jaz.hooks import OTelTracing
+
+class MyCollectorTracing(OTelTracing):
+    def __init__(self):
+        super().__init__(
+            endpoint="https://collector.example.com/v1/traces",
+            service_name="my-jaz-agent",
+            headers={"X-API-Key": "secret"},
+        )
+
+with MyCollectorTracing():
+    result = invoke(task="...")
+```
+
+</Accordion>

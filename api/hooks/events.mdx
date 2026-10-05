@@ -1,0 +1,430 @@
+---
+title: "Hook Events Reference: Invoke, LLMQuery, and REPLExec Spans"
+sidebarTitle: "Events"
+description: "Complete reference for all JAZ hook events across the Invoke, LLMQuery, and REPLExec spans — fields, stage pipeline, and outcome variants."
+---
+
+Hook events are typed objects that the framework fires at fixed points in an agent's execution. A hook handler receives an event, reads its fields, and returns a list of effects. Events are **immutable** — the same object is dispatched to every active hook in turn, so mutation is strictly unsupported. The only way to change behavior is to return effects.
+
+<Note>
+The hook system is **experimental**. Event interfaces may change in a future release.
+</Note>
+
+## Import path
+
+```python
+from jaz.hooks.events import (
+    # Invoke span
+    InvokeEnter, InvokeSend, InvokeComplete, InvokeExit,
+    # LLM query span
+    LLMQueryEnter, LLMQuerySend, LLMQueryComplete, LLMQueryExit,
+    LLMQueryRetry,
+    # REPL execution span
+    REPLExecEnter, REPLExecSend, REPLExecComplete, REPLExecExit,
+    # Outcome variants
+    Completed, Aborted, Failed,
+    # Outcome union type aliases
+    InvokeOutcome, LLMQueryOutcome, REPLExecOutcome,
+)
+```
+
+## Base class: `Event`
+
+All events inherit from `jaz.hooks.base.Event`. Every event carries these fields regardless of its span:
+
+<ResponseField name="config" type="Config">
+  The effective configuration for the invoke that produced this event (post-`ConfigOverride` / depth resolution). Read-only by convention.
+</ResponseField>
+
+<ResponseField name="blackboard" type="Blackboard">
+  The per-invoke cross-hook key-value store. Reads the current generation; writes via `BlackboardWrite` effects are applied after the full hook loop. See [Effects](/api/hooks/effects) for `BlackboardWrite`.
+</ResponseField>
+
+<ResponseField name="invoke_id" type="str">
+  UUID identifying the invoke that produced this event. Use this to correlate events across spans and to key per-invoke state in a propagating hook.
+</ResponseField>
+
+<ResponseField name="depth" type="int">
+  Absolute recursion depth of the invoke (1-based: the top-level invoke is depth 1, its first sub-invoke is depth 2, etc.).
+</ResponseField>
+
+<ResponseField name="hooks" type="tuple[Hook, ...]">
+  The live active hook set at emission time (baseline + propagating + local), in dispatch order. Read-only — mutating peers through this field is unsupported.
+</ResponseField>
+
+<ResponseField name="timestamp" type="datetime">
+  When this event was emitted to hooks — a timezone-aware UTC `datetime`. Stamped by the dispatcher immediately before the hook loop. Span duration is `Exit.timestamp - Enter.timestamp`.
+</ResponseField>
+
+## The four-stage pipeline
+
+Each span follows the same value-state pipeline. Events mark **when a value becomes fixed**, not phases of machinery:
+
+```
+proposal ──[edits]──▶ committed input ──[work or supply]──▶ raw result ──[modify]──▶ outcome
+
+*Enter    observes the proposal           controls edits + Abort     fires always
+*Send     observes the committed input    controls supply + Abort    fires iff input committed
+*Complete observes the raw result         controls modify + Abort    fires iff raw result exists
+*Exit     observes the outcome union      Abort (per-turn only)      fires whenever span opened
+```
+
+A `*Send` event fires even when a supply short-circuits execution — the input commit is real even when no provider is called. A `*Complete` event does not fire when the span unwinds abnormally before a result existed.
+
+## Outcome variants
+
+Every `*Exit` event's `outcome` field holds one of three tagged variants. Match on the type to branch on how the span ended:
+
+<Tabs>
+  <Tab title="Completed[T]">
+    The span produced its normal result. The payload `result` is the **post-transform** value — any `Modify*` effects composed at `*Complete` already applied.
+
+    ```python
+    from jaz.hooks.events import Completed, LLMQueryExit
+    from jaz.hooks.effects import Effect
+
+    def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
+        match event.outcome:
+            case Completed(result=response):
+                print(f"Cost: ${response.cost_usd}")
+        return []
+    ```
+  </Tab>
+  <Tab title="Aborted">
+    This invoke's own hook control plane issued an `Abort` effect. `exception` carries the abort's error, which still propagates after the exit event fires.
+
+    ```python
+    from jaz.hooks.events import Aborted, InvokeExit
+
+    match event.outcome:
+        case Aborted(exception=exc):
+            print(f"Invoke aborted: {exc}")
+    ```
+  </Tab>
+  <Tab title="Failed">
+    The span's machinery unwound on an in-flight exception before a result existed (provider error, `FatalError` from below, a child invoke's abort passing through, etc.). `exception` carries the propagating error.
+
+    ```python
+    from jaz.hooks.events import Failed, InvokeExit
+
+    match event.outcome:
+        case Failed(exception=exc):
+            print(f"Invoke failed: {exc}")
+    ```
+  </Tab>
+</Tabs>
+
+## Invoke span
+
+The Invoke span fires **once per `jaz.invoke()` call**, wrapping the entire agent loop.
+
+<Accordion title="InvokeEnter">
+
+Fired when `jaz.invoke` is called, before any LLM query.
+
+**Allowed effects:** `AddInputs`, `DropInputs`, `DisableRecursion`, `Abort`
+
+<ResponseField name="parent_invoke_id" type="str | None">
+  The enclosing invoke's ID, or `None` at the top level.
+</ResponseField>
+
+<ResponseField name="parent_repl_iteration" type="int | None">
+  The enclosing invoke's iteration that spawned this one, or `None` at the top level.
+</ResponseField>
+
+<ResponseField name="inputs" type="Mapping[str, object]">
+  The explicit `**inputs` kwargs passed to `jaz.invoke`, as a read-only mapping. Resolved values — `__jaz_get__` protocol already applied.
+</ResponseField>
+
+<ResponseField name="invoke_tool" type="InvokeTool | None">
+  The recursive sub-invoke primitive bound into this invoke (the REPL name `invoke`), or `None` when recursion is disabled.
+</ResponseField>
+
+<ResponseField name="scope" type="Mapping[str, object]">
+  The resolved ambient `jaz.scope` values, as a read-only mapping. Disjoint from `inputs`.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="InvokeSend">
+
+Fired when the invoke's input set has committed — after `AddInputs` / `DropInputs` effects have been folded in, before the first turn.
+
+**Allowed effects:** `SupplyInvokeResult`, `Abort`
+
+<ResponseField name="inputs" type="Mapping[str, object]">
+  The committed explicit inputs (post add/drop), as a read-only mapping.
+</ResponseField>
+
+<ResponseField name="added_inputs" type="Mapping[str, object]">
+  Inputs hooks added via `AddInputs`, as a read-only mapping.
+</ResponseField>
+
+<ResponseField name="dropped_inputs" type="AbstractSet[str]">
+  Input names hooks dropped via `DropInputs`, as a frozenset.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="InvokeComplete">
+
+Fired when the invoke's raw terminal result exists — the transform boundary. Does not fire when the invoke unwinds abnormally before a result.
+
+**Allowed effects:** `ModifyInvokeResult`, `Abort`
+
+<ResponseField name="result" type="Return | Raise">
+  The invoke's raw terminal result before any transform composes. A `Continue` is never produced here — an invoke only exits on a terminal result.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="InvokeExit">
+
+Fired when the invoke span closes, with the final outcome. **Observation-only** — no effect is valid here.
+
+<ResponseField name="outcome" type="InvokeOutcome">
+  `Completed[Return | Raise] | Aborted | Failed`. On `Completed`, `outcome.result` is the **post-transform** terminal result.
+</ResponseField>
+
+</Accordion>
+
+## LLMQuery span
+
+The LLMQuery span fires **once per turn**, on every turn unconditionally. It is the always-present per-turn boundary for loop control and budget enforcement.
+
+<Accordion title="LLMQueryEnter">
+
+Fired once per turn, before making an LLM API call. The home for per-turn hard stops (`Abort`) and prompt edits (`AddMessages` / `DropMessages`).
+
+**Allowed effects:** `AddMessages`, `DropMessages`, `Abort`
+
+<ResponseField name="messages" type="Sequence[MessageDict]">
+  The message buffer before this query's edits are folded in. Immutable tuple at runtime.
+</ResponseField>
+
+<ResponseField name="model" type="str">
+  The model about to be called.
+</ResponseField>
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this query belongs to (0-based).
+</ResponseField>
+
+<ResponseField name="can_recurse" type="bool">
+  Whether this invoke still has the recursive `jaz.invoke` tool. `False` when `DisableRecursion` was emitted at `InvokeEnter` (e.g. by `RecursionLimit`).
+</ResponseField>
+
+<ResponseField name="can_report_cost" type="bool" default="True">
+  Whether the LLM client will report a per-call cost for this model. Allows a cost budget to be rejected before the first query.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="LLMQuerySend">
+
+Fired when the query's input has committed — the post-edit message list is final. Fires on every path where the input commits, including when a `SupplyLLMResponse` answers here and skips the API call.
+
+**Allowed effects:** `SupplyLLMResponse`, `Abort`
+
+<ResponseField name="messages" type="Sequence[MessageDict]">
+  The committed message list — exactly what is handed to the result producer. Immutable tuple at runtime.
+</ResponseField>
+
+<ResponseField name="model" type="str">
+  The model the query is addressed to.
+</ResponseField>
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this query belongs to (0-based).
+</ResponseField>
+
+<ResponseField name="edits" type="ResolvedMessageEdits">
+  The enter-time edits that produced `messages`, as self-contained pre-resolved records. Contains `drops` (list of `MessageDropRecord`) and `adds` (list of `MessageAddRecord`).
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="LLMQueryComplete">
+
+Fired when the query's raw response exists — the response-transform boundary. The query is already finished; an `Abort` here stops the turn before the agent acts on the response.
+
+**Allowed effects:** `ModifyLLMResponse`, `Abort`
+
+<ResponseField name="response" type="LLMResponse">
+  The raw `LLMResponse` before any transform. Fields include `content`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `cost_usd`, `extra`, `raw_response`, `tokens`.
+</ResponseField>
+
+<ResponseField name="model" type="str">
+  The model that was called.
+</ResponseField>
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this query belongs to (0-based).
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="LLMQueryExit">
+
+Fired when the LLM-query span closes, with the query's final outcome. On the `Completed` arm, accepts `Abort` to stop the run on the basis of the **post-transform** response (after `ModifyLLMResponse` has resolved).
+
+**Allowed effects:** `Abort` (on every arm; on `Aborted`/`Failed` arms, folded into the in-flight exception rather than replacing it)
+
+<ResponseField name="outcome" type="LLMQueryOutcome">
+  `Completed[LLMResponse] | Aborted | Failed`. On `Completed`, `outcome.result` is the post-transform `LLMResponse`.
+</ResponseField>
+
+<ResponseField name="model" type="str">
+  The model that was called.
+</ResponseField>
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this query belongs to (0-based).
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="LLMQueryRetry">
+
+Fired each time an LLM call fails and is about to be retried. **Purely observational** — no effects can be emitted.
+
+<ResponseField name="model" type="str">
+  The model the failed call was addressed to.
+</ResponseField>
+
+<ResponseField name="attempt_number" type="int">
+  Which attempt just failed, counting from 1.
+</ResponseField>
+
+<ResponseField name="exception" type="Exception">
+  The error that caused the retry.
+</ResponseField>
+
+<ResponseField name="wait_seconds" type="float">
+  How long the retry will wait before the next attempt.
+</ResponseField>
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration the call belongs to (0-based).
+</ResponseField>
+
+</Accordion>
+
+## REPLExec span
+
+The REPLExec span fires **only when the LLM response parsed to runnable code**. It is conditional — a parse-failure turn opens no exec span. Loop control belongs on the always-present `LLMQueryEnter`, not here.
+
+<Accordion title="REPLExecEnter">
+
+Fired before executing parsed REPL code. The home for namespace edits (`AddVariables` / `DropVariables`) and code edits (`InsertCode` / `DeleteCode`).
+
+**Allowed effects:** `AddVariables`, `DropVariables`, `InsertCode`, `DeleteCode`, `Abort`
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this execution belongs to (0-based).
+</ResponseField>
+
+<ResponseField name="code" type="str">
+  The REPL source proposed by the LLM, **before** any `InsertCode` / `DeleteCode` edits. The committed code (after edits) is carried by `REPLExecSend`.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="REPLExecSend">
+
+Fired when the execution's code has committed — namespace deltas applied, code edits folded in.
+
+**Allowed effects:** `SupplyExecResult`, `Abort`
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this execution belongs to (0-based).
+</ResponseField>
+
+<ResponseField name="code" type="str">
+  The REPL source about to be executed — the committed code after any enter-time `InsertCode` / `DeleteCode` edits.
+</ResponseField>
+
+<ResponseField name="added_variables" type="Mapping[str, object]">
+  Namespace names bound before this turn's code, per the composed `AddVariables` effects. Read-only mapping.
+</ResponseField>
+
+<ResponseField name="dropped_variables" type="AbstractSet[str]">
+  Namespace names unbound before this turn's code, per the composed `DropVariables` effects. Frozenset.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="REPLExecComplete">
+
+Fired when the execution's raw result exists — the REPL transform boundary.
+
+**Allowed effects:** `ModifyExecResult`, `Abort`
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this execution belongs to (0-based).
+</ResponseField>
+
+<ResponseField name="exec_result" type="ExecResult">
+  The raw result before any transform — a `Continue`, `Return`, or `Raise`.
+</ResponseField>
+
+</Accordion>
+
+<Accordion title="REPLExecExit">
+
+Fired when the execution span closes, with the turn's final outcome. On the `Completed` arm, accepts `Abort` to stop on the basis of the **post-transform** result.
+
+**Allowed effects:** `Abort` (on every arm; on `Aborted`/`Failed` arms, folded into the in-flight exception)
+
+<ResponseField name="iteration" type="int">
+  The agent-loop iteration this execution belongs to (0-based).
+</ResponseField>
+
+<ResponseField name="outcome" type="REPLExecOutcome">
+  `Completed[ExecResult] | Aborted | Failed`. On `Completed`, `outcome.result` is the post-transform `ExecResult` (`Continue | Return | Raise`).
+</ResponseField>
+
+</Accordion>
+
+## Complete example
+
+This hook observes every span and logs a summary of the run:
+
+```python
+from jaz import invoke
+from jaz.hooks import Hook
+from jaz.hooks.base import Event
+from jaz.hooks.effects import Effect
+from jaz.hooks.events import (
+    InvokeEnter, InvokeExit, LLMQueryExit, REPLExecExit,
+    Completed, Aborted, Failed,
+)
+
+class RunSummaryHook(Hook):
+    def on_invoke_enter(self, event: InvokeEnter) -> list[Effect]:
+        print(f"Invoke started at depth {event.depth}: inputs={dict(event.inputs)}")
+        return []
+
+    def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
+        match event.outcome:
+            case Completed(result=resp):
+                print(f"  Turn {event.iteration}: cost=${resp.cost_usd or 0:.4f}")
+            case Aborted(exception=exc):
+                print(f"  Turn {event.iteration}: aborted — {exc}")
+            case Failed(exception=exc):
+                print(f"  Turn {event.iteration}: failed — {exc}")
+        return []
+
+    def on_invoke_exit(self, event: InvokeExit) -> list[Effect]:
+        match event.outcome:
+            case Completed(result=result):
+                print(f"Invoke completed: {result}")
+            case Aborted(exception=exc):
+                print(f"Invoke aborted: {exc}")
+            case Failed(exception=exc):
+                print(f"Invoke failed: {exc}")
+        return []
+
+with RunSummaryHook():
+    result = invoke(task="Return the number 42.")
+```

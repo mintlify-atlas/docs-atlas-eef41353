@@ -1,20 +1,111 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "JAZ: A Framework for Object-Oriented LLM Agents"
+sidebarTitle: "Home"
+description: "JAZ is a minimalist Python framework for building LLM agents that execute in a REPL loop, combining deterministic code with LLM reasoning."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+JAZ is a Python framework for building and running LLM agents. An agent gets a task, writes Python code in a REPL, observes results, and keeps iterating until the task is done — no orchestration boilerplate required. Pass tools as plain functions, control execution with composable hooks, and route to any LLM provider through LiteLLM.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first agent in under five minutes with a working code example.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install JAZ, set up API keys, and configure optional extras.
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/agent-loop">
+    Understand the agent loop, hooks, tools, and configuration model.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/invoke">
+    Full reference for `invoke`, `configure`, hooks, backends, and more.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## How JAZ Works
+
+JAZ runs agents as a conversation between an LLM and a Python REPL. Each turn, the LLM generates code, the REPL executes it, and the result is fed back — repeating until the agent calls `return` with its answer.
+
+<Steps>
+  <Step title="Install JAZ">
+    ```bash
+    pip install jaz-lang
+    ```
+  </Step>
+  <Step title="Set your API key">
+    ```bash
+    export OPENAI_API_KEY=sk-...
+    ```
+  </Step>
+  <Step title="Run your first agent">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import ReturnType
+
+    result = invoke(
+        ReturnType(int),
+        task="Calculate the factorial of 10",
+    )
+    print(result)  # 3628800
+    ```
+  </Step>
+  <Step title="Add tools and data">
+    ```python
+    def web_search(query: str) -> list[str]:
+        """Search the web and return result snippets."""
+        ...
+
+    result = invoke(
+        ReturnType(dict),
+        task="Look up each name and summarize what you find",
+        names=["ada lovelace", "grace hopper"],
+        web_search=web_search,
+    )
+    ```
+  </Step>
+</Steps>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="REPL-Based Agent Loop" icon="terminal">
+    Agents write and execute real Python code, observe results, and iterate — no rigid DAGs or hand-wired chains.
+  </Card>
+  <Card title="Tools as Plain Functions" icon="function">
+    Pass any Python function as a keyword argument. Its signature and docstring become the agent's description automatically.
+  </Card>
+  <Card title="Extensible Hook System" icon="plug">
+    Observe and influence every stage of agent execution via typed events and effects — add logging, budget limits, tracing, and custom logic without modifying core code.
+  </Card>
+  <Card title="Any LLM Provider" icon="cloud">
+    LiteLLM routes to OpenAI, Anthropic, Gemini, Bedrock, Vertex, and more. Local servers and custom backends are supported too.
+  </Card>
+  <Card title="Recursive Agent Composition" icon="sitemap">
+    Agents can spawn nested agents with separate budgets. Scope, config, and hooks propagate automatically through the invocation tree.
+  </Card>
+  <Card title="Built-in Observability" icon="chart-line">
+    Trajectory recording, Langfuse tracing, OpenTelemetry, Jaeger, and file/console loggers ship out of the box.
+  </Card>
+</CardGroup>
+
+## Explore the Docs
+
+<CardGroup cols={3}>
+  <Card title="Budget Control" icon="gauge" href="/guides/budget-control">
+    Enforce cost and iteration limits with `BudgetPool` and `IterationLimit`.
+  </Card>
+  <Card title="Custom Hooks" icon="wrench" href="/guides/custom-hooks">
+    Write your own hooks to observe events and return effects.
+  </Card>
+  <Card title="LLM Backends" icon="server" href="/guides/llm-backends">
+    Configure providers, local servers, and custom backends.
+  </Card>
+  <Card title="Tracing" icon="eye" href="/guides/tracing">
+    Integrate Langfuse, Jaeger, or any OTLP collector.
+  </Card>
+  <Card title="Async Agents" icon="bolt" href="/guides/async">
+    Use `ainvoke` for concurrent execution and top-level `await`.
+  </Card>
+  <Card title="JAZ Console" icon="square-terminal" href="/guides/console">
+    Interactive REPL with conversational sugar and a setup wizard.
+  </Card>
+</CardGroup>

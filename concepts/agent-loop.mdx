@@ -1,0 +1,119 @@
+---
+title: "How the JAZ Agent Loop Works"
+sidebarTitle: "Agent Loop"
+description: "Understand how JAZ orchestrates an LLM and a Python REPL in a turn-by-turn loop, from the first invoke call to the final return value."
+---
+
+JAZ agents run as a structured conversation between a language model and a live Python REPL. Rather than a single prompt-and-response exchange, JAZ iterates: the LLM writes Python code, the REPL runs it, the output feeds back as the next message, and the cycle continues until the agent signals it is done by executing a `return` statement. Understanding this loop is the foundation for using JAZ effectively.
+
+## The Loop at a Glance
+
+Each call to `invoke()` (or `ainvoke()`) launches one agent. That agent runs until it either returns a value, raises an exception, or is stopped by a hook. At a high level, one turn looks like this:
+
+<Steps>
+  <Step title="Receive inputs">
+    The framework renders all keyword arguments into a prompt header and binds each value as a variable in the REPL namespace. The agent sees both a description of what it has and a live binding it can call.
+  </Step>
+  <Step title="Query the LLM">
+    JAZ sends the current conversation — system prompt, prior turns, and any hook-injected messages — to the LLM. The model responds with a block of Python code.
+  </Step>
+  <Step title="Execute in the REPL">
+    The code block is executed in the agent's persistent Python REPL. Any output (printed values, expression results, exceptions) is captured and appended to the conversation as the LLM's observation.
+  </Step>
+  <Step title="Decide: continue or finish">
+    If the executed code contained a bare `return` statement, the loop ends and the returned value becomes `invoke()`'s result. If the code raised an exception, the traceback is shown to the model as feedback. Otherwise, the loop goes back to step 2 with the new output in context.
+  </Step>
+</Steps>
+
+## Starting and Ending an Invoke
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+# The agent writes Python until it executes `return <value>`
+result = invoke(
+    ReturnType(int),
+    task="Calculate the factorial of 10",
+)
+```
+
+The agent finishes by executing a Python `return` statement from within its REPL. This is not a function call — it is a literal `return` at the top level of the REPL session. If the agent wants to signal an error, it raises an exception; the traceback propagates out of `invoke()` as a normal Python exception to the caller.
+
+<Note>
+Positional arguments to `invoke()` are hooks (like `ReturnType(int)`) or a `ConfigOverride` — never data or a prompt string. All agent inputs, including the task description, are keyword arguments: `invoke(task="…", data=my_data)`.
+</Note>
+
+## Invoke Identity and the Recursion Tree
+
+Every `invoke()` call is assigned a UUID (`invoke_id`) and an integer `depth`. The top-level call is always `depth=1`. When the LLM's code itself calls `jaz.invoke(...)`, a child invoke is created at `depth+1`, with its `parent_invoke_id` pointing back to the parent. This forms a tree:
+
+<Accordion title="Fields carried on every hook event">
+| Field | Type | Meaning |
+|---|---|---|
+| `invoke_id` | `str` (UUID) | Unique identifier for this invoke |
+| `depth` | `int` | Absolute recursion depth; the top invoke is `1` |
+| `parent_invoke_id` | `str \| None` | UUID of the enclosing invoke, or `None` at the root |
+</Accordion>
+
+These fields appear on every event fired by the hook system (`event.invoke_id`, `event.depth`), so hooks can correlate events across the whole invocation tree without any extra bookkeeping.
+
+## Async Invocation with `ainvoke`
+
+`ainvoke` is the async counterpart of `invoke`. It accepts identical arguments and returns an awaitable, so the agent loop runs without blocking the event loop:
+
+```python
+import asyncio
+from jaz import ainvoke
+from jaz.hooks import ReturnType
+
+async def main():
+    result = await ainvoke(
+        ReturnType(int),
+        task="What is 7 factorial?",
+    )
+    return result
+
+asyncio.run(main())
+```
+
+The key behavioral difference is that `ainvoke` uses an async-capable REPL. Inside the agent's code blocks, top-level `await` expressions are valid. This means an agent running under `ainvoke` can call async tools and APIs directly:
+
+```python
+# Agent code (inside the REPL under ainvoke):
+result = await fetch_data(url)
+return result
+```
+
+Under `invoke`, the REPL is synchronous; `await` at the top level is a `SyntaxError` and the agent must work around it by calling sync tools or using `asyncio.run()`.
+
+## The Protocol Layer
+
+Before each LLM query, JAZ encodes the conversation into a message list using the configured protocol component. The default is `CodeOnlyProtocol`, which:
+
+1. Renders a system prompt describing the REPL-based execution model.
+2. Builds a prompt header listing all current inputs with their descriptions.
+3. Appends prior turns (code + output) as alternating user/assistant messages.
+4. Delivers the final assembled message list to the LLM.
+
+The protocol is replaceable — you can pass a `CodeOnlyProtocol(...)` instance to `jaz.configure()` or `ConfigOverride` to adjust template paths, output length caps, and truncation ratios. The protocol never appears in the agent's REPL; it lives entirely in the framework's message-building layer.
+
+## How Nested Agents Inherit Depth
+
+When an agent calls `jaz.invoke()` from inside its own REPL turn, that child invoke inherits the parent's hook context, configuration stack, and scope bindings. The child runs at `depth = parent.depth + 1`, and the parent's `parent_repl_iteration` is recorded on the child so hooks can trace exactly which REPL turn spawned the sub-agent.
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType, RecursionLimit
+
+with RecursionLimit(max_depth=3):
+    result = invoke(
+        ReturnType(list),
+        task="For each item, use jaz.invoke to process it and combine results.",
+        items=[1, 2, 3],
+    )
+```
+
+<Tip>
+Recursion is unbounded by default. Install `RecursionLimit` as a context manager to cap how deep the tree can grow. The hook fires a `DisableRecursion` effect at the cap leaf, which removes the `jaz.invoke` tool from the innermost agent's REPL entirely.
+</Tip>

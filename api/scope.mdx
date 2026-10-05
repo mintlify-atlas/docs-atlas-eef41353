@@ -1,0 +1,137 @@
+---
+title: "jaz.scope() — Ambient Inputs for Nested Invokes"
+sidebarTitle: "scope()"
+description: "Bind values as ambient inputs for all enclosed jaz.invoke calls including nested ones, with inner-shadow semantics, conflict detection, and thread-safe snapshot propagation."
+---
+
+`jaz.scope()` is a context manager that binds one or more values as **ambient inputs** — automatically available to every `jaz.invoke` call inside the block, and to every recursive sub-invoke below them, without threading the values through each intermediate call by hand. It is the solution to the manual-threading problem: a value that should live across many levels of nested invokes otherwise has to be re-passed at every layer, and a single forgotten kwarg silently drops it for the rest of the subtree.
+
+## Signature
+
+```python
+@contextmanager
+def scope(**values: object) -> Iterator[None]: ...
+```
+
+## Parameters
+
+<ParamField path="**values" type="object">
+  Keyword arguments to bind as ambient inputs. Each key must be a valid Python
+  identifier — it becomes a REPL global variable and a named item in the agent's
+  prompt header. Splat a dynamic mapping with `scope(**my_dict)`. A non-identifier
+  key raises `ValueError` at the binding site, not at invoke time.
+</ParamField>
+
+## Basic usage
+
+```python
+from jaz import invoke, scope
+
+with scope(fs=fs_tools, web=web_client):
+    invoke(task="analyze logs", target_date="2026-05-30")
+    # `fs` and `web` are bound in the REPL of this invoke and ALL recursive
+    # sub-invokes it spawns. `task` and `target_date` are local to this top-level
+    # invoke and do not propagate to sub-invokes.
+```
+
+This is equivalent to passing `fs=fs_tools, web=web_client` as kwargs to every invoke in the subtree, but without the manual threading and without the risk of forgetting a layer.
+
+## Inner-shadow semantics
+
+A nested `scope` block **shadows** an outer value for the same name and restores it on exit — standard context-manager semantics:
+
+```python
+from jaz import invoke, scope
+
+with scope(fs=shared_fs):
+    with scope(fs=isolated_fs):
+        invoke(task="use isolated fs")
+        # `fs` is `isolated_fs` here
+    invoke(task="use shared fs")
+    # `fs` is `shared_fs` again
+```
+
+There is no partial unbinding — you cannot remove a name for a block. An inner `scope` can only shadow it with a new value.
+
+## Conflict detection
+
+A name defined both via `scope` and passed as a keyword argument to the same `invoke` call is a **hard error** — it raises `ValueError`. Silent precedence rules would let a distant scope override a local kwarg (or vice versa) and ship the wrong behavior to production without any signal.
+
+```python
+from jaz import invoke, scope
+
+with scope(fs=fs_tools):
+    # This raises ValueError — `fs` is both scoped and an explicit kwarg
+    invoke(task="...", fs=other_fs)
+    # ValueError: Inputs ['fs'] conflict: each is defined both via jaz.scope(...)
+    # and passed as an explicit kwarg to jaz.invoke(). Remove the explicit kwarg;
+    # to override the scoped value for this call, shadow it with a nested
+    # `with jaz.scope(fs=...):` block instead.
+```
+
+To give a single invoke a different value for a scoped name, wrap it in a nested `scope` block:
+
+```python
+with scope(fs=shared_fs):
+    with scope(fs=special_fs):
+        invoke(task="this one uses special_fs")
+    invoke(task="this uses shared_fs")
+```
+
+## Difference from `**inputs`
+
+<CardGroup cols={2}>
+  <Card title="jaz.scope()" icon="broadcast-tower">
+    Values propagate automatically to **all** enclosed invokes, including all
+    recursive sub-invokes at arbitrary depth. Ideal for sessions clients, shared
+    datastores, or tools that the whole subtree needs.
+  </Card>
+  <Card title="**inputs kwargs" icon="hand-point-right">
+    Values are **local to one invoke**. The agent sees them in its REPL and
+    prompt header, but any `jaz.invoke(...)` the agent makes does not inherit
+    them. Ideal for per-call data like the task prompt or a specific dataframe.
+  </Card>
+</CardGroup>
+
+## Propagation across threads and async tasks
+
+Scope values propagate reliably across thread and task hops because JAZ uses a **snapshot-and-bind** strategy: the scope is snapshotted at the invoke boundary and bound as plain data on the agent-facing `jaz` object, exactly how `config` propagates. A bare `ContextVar` read inside a `ThreadPoolExecutor` worker would see an empty context and silently drop scope; the snapshot-and-bind approach does not.
+
+<Warning>
+  The snapshot copies the **mapping**, not the values themselves. Values are shared by reference. Under `ThreadPoolExecutor`, two workers may mutate the same scoped `list` or similar object concurrently — that is a data race you must guard. Bind immutable values, or rebind a fresh instance inside each worker with a nested `jaz.scope(...)` block.
+</Warning>
+
+## Process boundaries
+
+Scope does **not** propagate across process boundaries automatically:
+
+- Under **`spawn`** — the child is a fresh interpreter; its scope is empty. Bind values inside the worker using a `with scope(...)` block, which is the supported way to give a worker ambient values.
+- Under **`fork`** — the child inherits scope bindings as copied memory and invokes do run under them. This is not a guarantee to rely on: objects inherited across a `fork` (locks, open file handles, connection pools) may be unusable in the child. Rebind inside the worker rather than inheriting.
+
+## `get_scope()`
+
+`get_scope()` returns a **copy** of the values currently in scope. It is a runtime escape hatch for introspection and testing — mutating the returned dict does not affect the live binding (though mutating a *value* inside it still mutates the shared object).
+
+```python
+from jaz.scope import get_scope
+
+with scope(session_id="abc123", db=db_client):
+    current = get_scope()
+    # current == {"session_id": "abc123", "db": <db_client>}
+    assert "session_id" in current
+```
+
+## Full example
+
+```python
+from jaz import invoke, scope
+
+# Bind shared tools once, at the top of a workflow
+with scope(fs=fs_tools, web=web_client):
+    # Both fs and web are available in this invoke's REPL and in every
+    # recursive sub-invoke it spawns via jaz.invoke(...)
+    invoke(
+        task="Crawl the site, save results to disk, and return a summary",
+        target_url="https://example.com",
+    )
+```

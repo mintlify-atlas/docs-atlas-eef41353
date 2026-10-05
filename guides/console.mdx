@@ -1,0 +1,190 @@
+---
+title: "Using the JAZ Interactive Console"
+sidebarTitle: "JAZ Console"
+description: "Run the jaz CLI for a Python REPL with conversational sugar: sigil syntax for agent prompts, a setup wizard, session flags, and in-session model switching."
+---
+
+After `pip install jaz-lang`, the `jaz` command is available on your `PATH`. It opens a real Python REPL — variables persist, `_` holds the last result, history and tab-completion work — with a thin layer of conversational sugar on top. Any line that isn't a recognized sigil is passed through as ordinary Python.
+
+<Note>
+The `jaz` console requires **Python ≥ 3.14**. The sigil rewrites use PEP 750 t-strings, which are only available on 3.14+. Everything else in `jaz-lang` works on Python ≥ 3.12.
+</Note>
+
+## Starting the console
+
+```bash
+jaz
+```
+
+If no model is configured, a setup wizard runs first — see [Setup wizard](#setup-wizard) below.
+
+## Sigil syntax
+
+The console recognizes five special forms. Anything else is passed to the Python interpreter unchanged.
+
+<Accordion title="&gt; prompt — ask the agent">
+
+Ask the agent a question or give it a task. The result is printed and bound to `_`.
+
+```
+> what is 2 + 2?
+> summarize this paper: {paper_text}
+```
+
+Variables from the Python namespace are interpolated with `{var}`. Literal braces must be doubled: `{{` and `}}`.
+
+</Accordion>
+
+<Accordion title="name: T &lt;- prompt — capture a typed result">
+
+Ask the agent and bind the return value to a variable, optionally enforcing a type:
+
+```
+n: int <- how many days in a leap year?
+names: list <- give me five common first names
+result <- find the maximum of {values}
+```
+
+`n: int <- ...` is equivalent to `invoke(ReturnType(int), task=...)` — the type is checked and the agent retries if it returns the wrong type.
+
+</Accordion>
+
+<Accordion title="?expr — inspect a value">
+
+Print the JAZ description of any expression. For callable values the signature and docstring are shown; for described values the `jaz.describe` description is shown.
+
+```
+?n
+?my_function
+?invoke
+```
+
+</Accordion>
+
+<Accordion title="% instruction — ask the jaz helper">
+
+Ask a sandboxed helper agent to change settings, answer questions about JAZ, or run jaz-related Python with confirmation:
+
+```
+% switch to gpt-5-mini
+% what model am I using?
+% show me how to add a BudgetPool
+```
+
+For a settings change, the helper proposes a snippet and asks `Run this? [y/N]` before executing anything. For a question, it answers in plain text.
+
+</Accordion>
+
+<Accordion title="Plain Python">
+
+All other lines run as normal Python:
+
+```python
+import math
+data = [1, 2, 3, 4, 5]
+math.sqrt(2)
+```
+
+</Accordion>
+
+## Session example
+
+```
+> what is 2 + 2?
+n: int <- how many days in a leap year?
+?n
+% switch to gpt-5-mini
+import math
+```
+
+## Setup wizard
+
+The first time you run `jaz` without a configured model, a wizard runs automatically:
+
+<Steps>
+  <Step title="Choose a provider">
+    Pick from a list of providers (OpenAI, Anthropic, Gemini, and more) or choose **GitHub Copilot** to authenticate without an API key.
+  </Step>
+  <Step title="Enter your API key">
+    Paste the API key for your chosen provider. The wizard uses hidden input so the key never appears on screen or enters the console history. Keys go in `~/.jaz/credentials.json`.
+  </Step>
+  <Step title="Choose a model">
+    Pick a model for the chosen provider.
+  </Step>
+  <Step title="Validate">
+    The wizard makes one live one-token request to confirm the key and model work before saving anything. Settings are written to `~/.jaz/settings.json`.
+  </Step>
+</Steps>
+
+To re-run the wizard in a live session:
+
+```python
+setup_llm()
+```
+
+## Session flags
+
+Flags configure a single session without touching `~/.jaz/settings.json`:
+
+| Flag | Description |
+|------|-------------|
+| `--backend <name>` | Use a specific backend (`litellm`, `copilot`) |
+| `--model <id>` | Use a specific model ID |
+| `--max-cost <usd>` | Hard stop once the session has spent this many USD |
+| `--log <file>` | Write all events to a log file |
+| `-c "<prompt>"` | Run a single prompt and exit |
+
+```bash
+jaz --backend copilot --model gpt-5-mini
+jaz --max-cost 0.50 --log session.log
+jaz -c "what is the capital of France?"
+```
+
+## In-session commands
+
+Two console-bound functions are available in every session:
+
+### `switch_model(model_id)`
+
+Change the active model without touching the backend. The model is validated with a live one-token request before the switch takes effect. If validation fails, the current model stays in force.
+
+```python
+switch_model("openai/gpt-5")
+switch_model("gpt-5-mini", backend="copilot")  # also change backend
+```
+
+### `setup_llm()`
+
+Re-run the full interactive setup wizard to change provider, API key, or model. The new configuration is validated and saved to `~/.jaz/settings.json`.
+
+```python
+setup_llm()
+```
+
+### `set_credential(provider)`
+
+Store an API key for a provider. The key is prompted with hidden input:
+
+```python
+set_credential("anthropic")   # prompts: Enter API key for anthropic:
+set_credential("openai")
+```
+
+## Conversation memory
+
+The `>` and `<-` sigils share a conversation history across turns. Each turn passes the previous turns' prompts and results to the agent as `conversation_history`, so you can refer to earlier results naturally:
+
+```
+> load the CSV at data.csv
+> what are the column names?
+> plot the distribution of {_['age']}
+```
+
+The agent receives the live objects from earlier turns, not just their string representations, so it can inspect a previous `DataFrame` or list directly.
+
+## Configuration file locations
+
+| File | Contents |
+|------|----------|
+| `~/.jaz/settings.json` | Default backend, model, and other session defaults |
+| `~/.jaz/credentials.json` | Provider API keys (written by the wizard and `set_credential`) |

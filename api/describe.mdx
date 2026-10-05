@@ -1,0 +1,192 @@
+---
+title: "jaz.describe() — Attach Prompt Descriptions to Values"
+sidebarTitle: "describe()"
+description: "Attach a permanent description to any value so it renders meaningfully in the agent's prompt header when passed as an invoke input, with three storage strategies and scoped DescriptionOverride."
+---
+
+When a value is passed as a keyword input to `jaz.invoke`, JAZ renders it in the agent's prompt header. By default it uses the value's `str()` representation, or a synthesised signature-and-docstring block for callables and classes. `jaz.describe()` lets you replace that default with a custom description — attached permanently to the object itself, so it travels with the value into any nested `jaz.invoke` call without any extra wiring.
+
+<Note>
+  The description system is **experimental**. Its interfaces — including `jaz.describe`, `DescriptionOverride`, and `get_default_description` — may change in a future release.
+</Note>
+
+## Signature
+
+```python
+def describe(value: T, description: DescriptionValue) -> T: ...
+```
+
+`describe` always returns its first argument unchanged. `describe(x, ...) is x` is always `True`, and `type(x)` is unaffected. The value is never altered, replaced, or wrapped.
+
+## Parameters
+
+<ParamField path="value" type="T">
+  The object to attach the description to. Any Python value is accepted. See
+  [Storage strategies](#storage-strategies) for how the description is stored
+  depending on the type.
+</ParamField>
+
+<ParamField path="description" type="str | Callable | jaz.Catalog">
+  What to render in the agent's prompt header. Three forms are accepted:
+
+  - **`str`** — literal prompt text rendered verbatim.
+  - **`Callable`** — evaluated lazily at read time. May accept `(value)` or
+    `(value, bound_name)` as arguments, where `bound_name` is the kwarg name the
+    value was passed under at the `jaz.invoke` call site. JAZ detects the arity
+    automatically.
+  - **`jaz.Catalog`** render mode — renders the value as a tool catalog, rooted at
+    the kwarg name. Useful for tool-namespace objects.
+</ParamField>
+
+## Basic examples
+
+```python
+import jaz
+
+# Literal string description
+sales_df = load_sales_data()
+jaz.describe(sales_df, "Q1 2026 sales data: one row per transaction, columns: date, amount, region")
+
+result = jaz.invoke(task="Summarise total sales by region", sales=sales_df)
+# The agent sees: `sales`: Q1 2026 sales data: one row per...
+```
+
+```python
+import jaz
+
+# Callable description — reflects current state
+items = [1, 2, 3]
+jaz.describe(items, lambda v: f"A list of {len(v)} integers")
+
+result = jaz.invoke(task="Double each number", numbers=items)
+# The agent sees: `numbers`: A list of 3 integers
+```
+
+```python
+import jaz
+
+# Callable that receives the bound name as well
+config = {"timeout": 30, "retries": 3}
+jaz.describe(config, lambda v, name: f"`{name}` has {len(v)} settings")
+
+result = jaz.invoke(task="Print the config", settings=config)
+# The agent sees: `settings` has 2 settings
+```
+
+## The description travels with the value
+
+Because the description is attached to the object (or stored by identity), it is automatically present in every `jaz.invoke` call the value is passed to — including nested invokes deep in a recursion tree:
+
+```python
+import jaz
+
+db = connect_to_database()
+jaz.describe(db, "Production read-only database connection. Use `db.query(sql)` to run queries.")
+
+# The description renders in every invoke that receives `db`, at any depth
+with jaz.scope(db=db):
+    jaz.invoke(task="Analyse the orders table")
+```
+
+## Composing with the default
+
+Use `get_default_description` to prepend a note without replacing the auto-generated description:
+
+```python
+import jaz
+from jaz.descriptions import get_default_description
+
+tools = MyToolNamespace()
+jaz.describe(
+    tools,
+    lambda v, name: f"Prefer `search` first.\n\n{get_default_description(v, name)}"
+)
+```
+
+## Storage strategies
+
+JAZ tries three storage paths in order, choosing the first that works for the value's type:
+
+<Steps>
+  <Step title="Attribute on the object">
+    `object.__setattr__(value, '__jaz_description__', description)` — works for the vast majority of user-defined classes. The description is stored directly on the object, survives `copy.copy` and `copy.deepcopy`, and is visible under `dir(obj)`.
+  </Step>
+  <Step title="Weak side-table">
+    For values that reject attribute assignment but are both weak-referenceable and hashable (slotted classes, `frozenset`), the description is stored in a `WeakKeyDictionary`. The entry is collected when the value is garbage-collected — no memory cost.
+  </Step>
+  <Step title="Retaining table (bare built-ins)">
+    For values that can hold neither an attribute nor a weak reference — bare built-ins such as `list`, `dict`, `int`, `str` — the description is stored in a process-global `id()`-keyed table that **retains the value**. The value is never garbage-collected. This is sound: without retaining the value, CPython's aggressive address recycling could let a new object silently inherit a dead one's description.
+  </Step>
+</Steps>
+
+### Describing built-ins
+
+Bare built-in values (bare `list`, `dict`, `int`, etc.) are stored in the retaining table. A copy of a bare built-in (`list(my_list)`, `dict(my_dict)`) is a new object with a new identity — it comes back undescribed. Prefer composing the built-in inside a small object of your own:
+
+```python
+import jaz
+
+class ReportData:
+    """Container for the monthly report rows."""
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+data = ReportData(rows)
+jaz.describe(data, "Monthly report: each row has date, revenue, and cost columns")
+result = jaz.invoke(task="Summarise the report", report=data)
+```
+
+## Warnings
+
+<Warning>
+  **`DescriptionSharedValueWarning`** — emitted when you call `jaz.describe` on a value CPython interns process-wide: `None`, `True`, `False`, or any small integer in the range `[-5, 256]`. Every occurrence of that value in the entire process — including inside libraries you did not write — now renders the same description. Describe a small container object that holds the value instead.
+
+  ```python
+  jaz.describe(42, "row count")
+  # DescriptionSharedValueWarning: jaz.describe was called on 42, which CPython shares
+  # across the entire process — every other use of this value now renders this description too...
+  ```
+</Warning>
+
+<Warning>
+  **`DescriptionRetentionWarning`** — emitted once many bare built-in values have accumulated in the retaining table (threshold: 128, doubling after each warning). If you are calling `describe` in a loop or a per-request path, describe a longer-lived object that contains the value instead, or hoist the `describe` call outside the loop.
+</Warning>
+
+## `DescriptionOverride`
+
+`DescriptionOverride` scopes one or more descriptions to a `with` block **without attaching anything permanently to the values**. It is the scoped counterpart to `jaz.describe`, mirroring how `jaz.ConfigOverride` is the scoped counterpart to `jaz.configure`.
+
+```python
+from jaz.descriptions import DescriptionOverride
+
+# Override for one block — does not modify sales_df or test_df
+with DescriptionOverride(
+    (sales_df, "Q1 2026 sales data"),
+    (test_df, "Held-out validation rows"),
+):
+    jaz.invoke(task="Compare training vs validation distributions", train=sales_df, test=test_df)
+```
+
+Overrides match by **object identity** — not by equality — so two equal-but-distinct values keep separate descriptions. Unhashable values like `list` and `DataFrame` work fine as subjects.
+
+<Note>
+  **Layering semantics**: a `jaz.describe` call made *inside* a `DescriptionOverride` block updates the permanent base beneath the shadow layer. The override continues to take effect for the whole extent of the block; the new `describe` value surfaces only once the scope exits. This mirrors the `jaz.configure` / `jaz.ConfigOverride` layering model exactly.
+</Note>
+
+## `get_default_description()`
+
+`get_default_description(value, bound_name=None)` returns the description JAZ would render when no `describe` has been attached — the same text an agent sees for an undecorated input. It is useful for composing a custom prefix or suffix without having to replicate the rendering logic:
+
+```python
+from jaz.descriptions import get_default_description
+
+sig_and_doc = get_default_description(my_function, "process")
+# e.g. "`process(x: int, y: str) -> bool`: Check whether x satisfies y."
+```
+
+The rendering rules:
+
+- **Class** — its docstring and a list of public members with their signatures.
+- **Callable** — its signature and docstring.
+- **Object with no custom `__str__`** — its class docstring and public instance attributes.
+- **Everything else** — `str(value)`.

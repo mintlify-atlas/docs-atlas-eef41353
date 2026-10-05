@@ -1,0 +1,208 @@
+---
+title: "Tracing JAZ Agents with Langfuse, Jaeger, and OTel"
+sidebarTitle: "Tracing"
+description: "Export JAZ agent runs as OpenTelemetry spans to Langfuse or Jaeger, record ATIF trajectories for replay and cost analysis, and log events to file."
+---
+
+JAZ ships several hooks for observability. The tracing hooks (`LangfuseTracing`, `JaegerTracing`, `OTelTracing`) export every invoke, LLM call, and REPL turn as OpenTelemetry spans. The trajectory hooks record structured run files that can be replayed offline. The logger hooks write human-readable event streams to the console or a file.
+
+## Installing the tracing extra
+
+The OTel-based tracing hooks require the `tracing` optional dependency group:
+
+```bash
+pip install "jaz-lang[tracing]"
+```
+
+Without this extra, importing `LangfuseTracing`, `JaegerTracing`, or `OTelTracing` raises `ImportError`.
+
+---
+
+## LangfuseTracing — Langfuse Cloud quickstart
+
+`LangfuseTracing` exports traces to Langfuse using OTLP HTTP. Wrap any `invoke` call with the hook and JAZ will send spans automatically:
+
+```python
+from jaz import invoke
+from jaz.hooks import LangfuseTracing, ReturnType
+
+with LangfuseTracing():
+    result = invoke(ReturnType(int), task="Calculate 2+2")
+```
+
+Credentials are read from environment variables by default:
+
+| Variable | Description |
+|----------|-------------|
+| `LANGFUSE_PUBLIC_KEY` | Your Langfuse project's public key |
+| `LANGFUSE_SECRET_KEY` | Your Langfuse project's secret key |
+| `LANGFUSE_HOST` | Base URL (default: `https://cloud.langfuse.com`). `LANGFUSE_BASE_URL` is also accepted. |
+
+You can also pass credentials directly:
+
+```python
+with LangfuseTracing(
+    public_key="pk-...",
+    secret_key="sk-...",
+    base_url="https://cloud.langfuse.com",
+    service_name="my-agent",
+    max_attribute_length=4096,   # truncate long span attributes
+):
+    result = invoke(ReturnType(str), task="Build something")
+```
+
+---
+
+## JaegerTracing — local Jaeger preset
+
+`JaegerTracing` is a preset that exports to a local Jaeger instance via OTLP HTTP. The default endpoint is `http://localhost:4318/v1/traces`.
+
+```python
+from jaz.hooks import JaegerTracing
+
+with JaegerTracing():
+    result = invoke(task="Run an agent")
+```
+
+```python
+# Custom endpoint
+with JaegerTracing(
+    endpoint="http://jaeger.internal:4318/v1/traces",
+    service_name="my-agent",
+):
+    result = invoke(task="Run an agent")
+```
+
+---
+
+## OTelTracing — base class for custom OTLP exporters
+
+`OTelTracing` is the base class that `LangfuseTracing` and `JaegerTracing` both extend. Subclass it to export to any OTLP-compatible collector — Grafana Tempo, Honeycomb, Datadog, or your own:
+
+```python
+from jaz.hooks.builtin import OTelTracing
+
+class MyCollectorTracing(OTelTracing):
+    def __init__(self):
+        super().__init__(
+            endpoint="https://my-collector.example.com/v1/traces",
+            service_name="jaz-agent",
+            headers={"x-my-auth": "secret"},
+        )
+
+with MyCollectorTracing():
+    result = invoke(task="Run an agent")
+```
+
+Every JAZ span carries structured attributes including `jaz.invoke_id`, `jaz.depth`, `jaz.model`, `jaz.iteration`, `jaz.cost_usd`, `jaz.prompt_tokens`, `jaz.completion_tokens`, and more. Retry attempts appear as span events on the `llm_query` span.
+
+---
+
+## TrajectoryRecorder — ATIF trajectory files
+
+`TrajectoryRecorder` writes the full run as an ATIF trajectory file. Trajectories contain the complete message history, every LLM response, token counts, cost breakdowns per invoke, and sub-invoke trees — they are the canonical source for cost analysis and offline replay.
+
+```python
+from jaz.hooks import TrajectoryRecorder
+
+with TrajectoryRecorder(output_path="run.atif"):
+    result = invoke(ReturnType(str), task="Complex task")
+```
+
+<Note>
+`TrajectoryRecorder` cannot be reactivated on the same instance when `output_path` is set — the second run would overwrite the first. Construct a new instance for each activation.
+</Note>
+
+---
+
+## TrajectoryDirectoryRecorder — browsable live run directory
+
+`TrajectoryDirectoryRecorder` writes the run as a browsable Markdown directory, updating **live** while the agent runs. You can `tail -f` files in the output directory to follow the agent's progress:
+
+```python
+from jaz.hooks import TrajectoryDirectoryRecorder
+
+with TrajectoryDirectoryRecorder(output_dir="./run_logs"):
+    result = invoke(ReturnType(str), task="Long-running task")
+```
+
+---
+
+## TrajectoryReplay — resume from a recorded trajectory
+
+`TrajectoryReplay` replays a recorded ATIF trajectory file. Saved LLM responses are returned from the replay cache; once the cached turns are exhausted, live LLM calls take over. This lets you resume a partial run or develop/debug a prompt without re-running expensive early turns.
+
+```python
+from jaz.hooks import TrajectoryReplay
+
+with TrajectoryReplay(input_path="run.atif"):
+    result = invoke(ReturnType(str), task="Complex task")
+```
+
+---
+
+## PrintLogger and FileLogger — simple event logging
+
+For lightweight logging without a tracing backend, use `PrintLogger` (colors, stdout) or `FileLogger` (plain text, file):
+
+```python
+from jaz.hooks import PrintLogger, FileLogger
+
+# Log to the terminal
+with PrintLogger():
+    result = invoke(task="Run an agent")
+
+# Log to a file
+with FileLogger("agent.log"):
+    result = invoke(task="Run an agent")
+```
+
+Both hooks are pure observers — they return no effects and never influence the run.
+
+---
+
+## Composing tracing with other hooks
+
+Tracing hooks compose freely with budget, limit, and custom hooks:
+
+```python
+from jaz.hooks import LangfuseTracing, BudgetPool, FileLogger, ReturnType
+
+with LangfuseTracing(), BudgetPool(cost_budget=1.0), FileLogger("run.log"):
+    result = invoke(ReturnType(str), task="Analyze the dataset", data=df)
+```
+
+<Tip>
+For a list of hooks determined at runtime, use `contextlib.ExitStack`:
+
+```python
+from contextlib import ExitStack
+from jaz.hooks import LangfuseTracing, FileLogger
+
+hooks = [LangfuseTracing(), FileLogger("run.log")]
+
+with ExitStack() as stack:
+    for hook in hooks:
+        stack.enter_context(hook)
+    result = invoke(task="Run an agent")
+```
+</Tip>
+
+---
+
+## Hook summary
+
+<Accordion title="All observability hooks at a glance">
+
+| Hook | Description |
+|------|-------------|
+| `LangfuseTracing()` | Export OTel spans to Langfuse Cloud |
+| `JaegerTracing()` | Export OTel spans to a local Jaeger instance |
+| `OTelTracing(endpoint=, ...)` | Base class — subclass for any OTLP collector |
+| `TrajectoryRecorder(output_path=)` | Write an ATIF trajectory file (replay/cost source) |
+| `TrajectoryDirectoryRecorder(output_dir=)` | Write a live, browsable Markdown run directory |
+| `TrajectoryReplay(input_path=)` | Replay saved responses, then fall back to live calls |
+| `PrintLogger()` | Stream colored events to the terminal |
+| `FileLogger(path)` | Stream plain events to a file |
+
+</Accordion>

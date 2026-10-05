@@ -1,0 +1,220 @@
+---
+title: "JAZ Hooks: Observe and Influence Agent Execution"
+sidebarTitle: "Hooks"
+description: "Understand JAZ hooks: typed event handlers, the Enter/Send/Complete/Exit pipeline, effects as the only influence mechanism, and composing multiple hooks."
+---
+
+Hooks are the extensibility mechanism in JAZ. They let you observe, modify, and control every stage of an agent's execution without changing how you call `invoke()`. A hook is a class that overrides typed event handlers; each handler receives a rich event object and returns a list of effects — the only way a hook changes anything. This keeps hooks composable and their interactions order-independent.
+
+<Info>
+The hook system is an experimental feature. Its interfaces may change in a future release. The built-in hooks (`ReturnType`, `BudgetPool`, `IterationLimit`, etc.) are stable for practical use; the event and effect vocabularies may evolve.
+</Info>
+
+## Two Ways to Activate a Hook
+
+Hooks have two activation modes, and they differ in scope:
+
+<Tabs>
+  <Tab title="Context manager (propagating)">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import Hook
+
+    with MyHook():
+        invoke(task="Solve this step by step")
+        # MyHook is active here AND in every nested invoke()
+    ```
+
+    The `with MyHook():` form registers the hook on a `ContextVar`, so it propagates automatically to every `invoke()` in the block — including those called recursively by the agent itself. Use this for logging, budgets, and any constraint that must apply to the whole tree.
+  </Tab>
+  <Tab title="Positional argument (local)">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import Hook
+
+    invoke(MyHook(), task="Solve this step by step")
+    # MyHook is active for THIS invoke only.
+    # Nested invokes that the agent spawns do NOT see it.
+    ```
+
+    Passing a hook instance as a positional argument to `invoke()` scopes it to that one call. The agent's own recursive `jaz.invoke()` calls construct fresh dispatchers and will not see this hook. Use this for per-call validation or rate limits that should not cascade.
+  </Tab>
+</Tabs>
+
+<Warning>
+The same hook **instance** cannot be active in both forms at once. Activating an instance via `with` while it is already active as a positional argument (or vice versa) raises `HookActivationError`. Distinct instances of the same class can be stacked freely.
+</Warning>
+
+## The Event Pipeline: Three Spans, Four Stages
+
+Events fire around three execution spans. Each span walks the same four stages in order:
+
+| Stage | Fires when | What hooks can do |
+|---|---|---|
+| `*Enter` | The span is about to start; the proposal is visible | Return edit effects (`AddMessages`, `AddVariables`, etc.) or `Abort` |
+| `*Send` | The input has committed; work is about to happen | Supply a result to skip the work (`SupplyLLMResponse`, `SupplyExecResult`) or `Abort` |
+| `*Complete` | A raw result exists; before the loop acts on it | Transform the result (`ModifyExecResult`, `ModifyLLMResponse`) or `Abort` |
+| `*Exit` | The span has closed; outcome is final | Observation only (`InvokeExit`); per-turn exits also accept `Abort` |
+
+The three spans are:
+
+- **Invoke** — wraps the whole `invoke()` call: `InvokeEnter` → `InvokeSend` → `InvokeComplete` → `InvokeExit`
+- **LLMQuery** — wraps each LLM API call per turn: `LLMQueryEnter` → `LLMQuerySend` → `LLMQueryComplete` → `LLMQueryExit`
+- **REPLExec** — wraps each code execution per turn: `REPLExecEnter` → `REPLExecSend` → `REPLExecComplete` → `REPLExecExit`
+
+There is also `LLMQueryRetry`, which fires for each retry attempt on a failed LLM call. It is observation-only.
+
+## Writing a Hook
+
+Subclass `jaz.hooks.Hook` and override the typed handler methods for the events you care about. Each handler receives the event object and returns a list of effects. An empty list means no influence:
+
+```python
+from jaz import invoke
+from jaz.hooks import Hook
+from jaz.hooks.effects import AddMessages, Effect
+from jaz.hooks.events import LLMQueryEnter
+
+class ConciseHook(Hook):
+    """Instruct the agent to be concise after iteration 3."""
+
+    # Override the typed per-event handler for the event you care about — no
+    # isinstance/dispatch boilerplate. (A cross-cutting observer that wants *every*
+    # event overrides `on_any` instead.)
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        if event.iteration >= 3:  # iterations are 0-based
+            return [AddMessages([{"role": "user", "content": "Be concise."}])]
+        return []
+
+# Hooks activate via context managers and propagate to nested invoke() calls
+with ConciseHook():
+    result = invoke(task="Solve this step by step")
+```
+
+The handler name is always `on_<snake_case_event_name>`. For `LLMQueryEnter` that is `on_llm_query_enter`; for `REPLExecComplete` it is `on_repl_exec_complete`. If you want a single handler that receives every event, override `on_any` — it runs in addition to the matched typed handler.
+
+## Contextual Data on Events
+
+Every event carries:
+
+- `event.config` — the effective `Config` for this invoke (post-`ConfigOverride`, post-depth resolution)
+- `event.blackboard` — the per-invoke `Blackboard` for cross-hook coordination (see below)
+- `event.invoke_id` — UUID of the invoke this event belongs to
+- `event.depth` — absolute recursion depth (root = 1)
+- `event.hooks` — the active hook set at this event
+- `event.timestamp` — UTC datetime when the event was emitted
+
+Span-specific events add fields relevant to that stage. For example, `LLMQueryEnter` carries `event.iteration` (0-based turn counter), `event.model`, and `event.messages`. `REPLExecEnter` carries `event.code` (the proposed Python code).
+
+## Effects: The Only Way to Change Execution
+
+Returning effects from a handler is the only mechanism hooks have to influence the run. Effects are valid only at specific stages; returning one at the wrong stage raises `InvalidEffectError`. Here is the full effect-to-stage mapping:
+
+<Accordion title="Effect reference table">
+| Effect | Valid stage | What it does |
+|---|---|---|
+| `AddInputs` / `DropInputs` | `InvokeEnter` | Add or remove invoke inputs (prompt + REPL) |
+| `DisableRecursion` | `InvokeEnter` | Withhold the recursive `jaz.invoke` tool |
+| `AddMessages` / `DropMessages` | `LLMQueryEnter` | Edit messages sent to the model (transient or persistent) |
+| `AddVariables` / `DropVariables` | `REPLExecEnter` | Bind or unbind REPL namespace names for the turn |
+| `InsertCode` / `DeleteCode` | `REPLExecEnter` | Edit the proposed code before it runs |
+| `SupplyLLMResponse` | `LLMQuerySend` | Supply a response, skipping the API call |
+| `SupplyExecResult` | `REPLExecSend` | Supply a result, skipping REPL execution |
+| `SupplyInvokeResult` | `InvokeSend` | Supply an invoke result, skipping the whole agent loop |
+| `ModifyExecResult` | `REPLExecComplete` | Replace the raw REPL execution result |
+| `ModifyInvokeResult` | `InvokeComplete` | Replace the invoke's terminal result |
+| `ModifyLLMResponse` | `LLMQueryComplete` | Modify the LLM response before the agent acts on it |
+| `Abort` | Any `*Enter`, `*Send`, `*Complete`; per-turn `*Exit` | Abort the invoke; the carried exception propagates from `invoke()` |
+| `BlackboardWrite` | Any event | Write a key/value to the per-invoke blackboard |
+</Accordion>
+
+## Composing Multiple Hooks
+
+Multiple hooks stack naturally. As context managers, nest them on the same `with` line:
+
+```python
+from jaz.hooks import BudgetPool, FileLogger
+
+with ConciseHook(), FileLogger("agent.log"), BudgetPool(cost_budget=1.0):
+    result = invoke(task="Build a web scraper")
+```
+
+All active hooks receive every event in registration order. Their effects are collected together and composed by the framework before being applied. Composition is order-independent for most effects: two `AddMessages` effects merge by slot, two `DropMessages` effects union their indices, and so on. For effects that name a unique resource (like `SupplyLLMResponse`, which must have at most one author per turn), a conflict raises immediately.
+
+For a dynamic list of hooks, use `contextlib.ExitStack`:
+
+```python
+from contextlib import ExitStack
+from jaz import invoke
+
+hook_list = [hook_a, hook_b, hook_c]
+
+with ExitStack() as stack:
+    for hook in hook_list:
+        stack.enter_context(hook)
+    invoke(task="...")
+```
+
+## Cross-Hook Coordination via the Blackboard
+
+When two hooks need to exchange information during a run, they use the **Blackboard** — a per-invoke key/value store available on every event as `event.blackboard`. One hook writes by returning a `BlackboardWrite` effect; another reads with `event.blackboard[key]` or `event.blackboard.get(key)`.
+
+Writes are applied after every hook in a given event has run (the "generational barrier"), so a write is invisible to the event that produced it but visible at the next event. This keeps hooks order-independent:
+
+```python
+from jaz.hooks import Hook
+from jaz.hooks.effects import BlackboardWrite, Effect
+from jaz.hooks.events import LLMQueryEnter, LLMQueryComplete
+
+class CostTrackingHook(Hook):
+    """Publish accumulated cost for other hooks to read."""
+
+    def on_llm_query_complete(self, event: LLMQueryComplete) -> list[Effect]:
+        current = event.blackboard.get("total_cost", 0.0) or 0.0
+        new_cost = current + (event.response.cost_usd or 0.0)
+        return [BlackboardWrite(key="total_cost", value=new_cost)]
+```
+
+Declare which keys your hook reads (`blackboard_consumes`) and writes (`writes_blackboard`) as class-level attributes for early conflict detection and lint warnings.
+
+## Built-in Hooks
+
+JAZ ships a full suite of ready-made hooks. Import them from `jaz.hooks`:
+
+<CardGroup cols={2}>
+  <Card title="ReturnType" icon="check">
+    Declare and enforce the invoke's return type. Pass as `invoke(ReturnType(int), ...)`.
+  </Card>
+  <Card title="BudgetPool" icon="coin">
+    Shared LLM cost and call-count budget enforced across the whole invocation tree.
+  </Card>
+  <Card title="IterationLimit" icon="arrows-repeat">
+    Cap the number of REPL turns per invoke level.
+  </Card>
+  <Card title="RecursionLimit" icon="layer-group">
+    Cap the maximum recursion depth for nested invokes.
+  </Card>
+  <Card title="ValidateReturn" icon="shield-check">
+    Validate the return value with a custom predicate before it leaves `invoke()`.
+  </Card>
+  <Card title="ValidateREPLCode" icon="code">
+    Inspect (and optionally veto) each code block before it runs.
+  </Card>
+  <Card title="PrintLogger / FileLogger" icon="file-lines">
+    Log all events to stdout or a file as the run proceeds.
+  </Card>
+  <Card title="TrajectoryRecorder" icon="video">
+    Write the run as an ATIF trajectory for replay and cost analysis.
+  </Card>
+  <Card title="TrajectoryReplay" icon="rotate-left">
+    Resume from a saved ATIF trace; saved responses replay, then live calls take over.
+  </Card>
+  <Card title="BudgetForcing" icon="ban">
+    Refuse early finishes so the agent keeps working through its full budget.
+  </Card>
+  <Card title="LangfuseTracing / JaegerTracing" icon="chart-line">
+    OpenTelemetry tracing presets for Langfuse and Jaeger.
+  </Card>
+  <Card title="ContextWindowWarning" icon="triangle-exclamation">
+    Warn the agent as its prompt approaches the model's context limit.
+  </Card>
+</CardGroup>

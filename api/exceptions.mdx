@@ -1,0 +1,537 @@
+---
+title: "JAZ Exception Hierarchy"
+sidebarTitle: "Exceptions"
+description: "Every JAZ exception and warning: sandbox violations, budget limits, hook errors, LLM provider failures, and description warnings — with catch patterns."
+---
+
+Every exception JAZ raises derives from `JazException`, which itself derives from `Exception`. A single `except JazException` around `jaz.invoke()` catches all of them. For finer control, catch the specific subclass that matches the failure you want to handle. All exceptions are importable from `jaz.exceptions`.
+
+```python
+from jaz.exceptions import (
+    JazException,
+    FatalError,
+    BudgetExhaustedError,
+    IterationLimitExhaustedError,
+    SandboxPermissionError,
+    LLMError,
+    RateLimitError,
+    # ... see sections below for the full list
+)
+```
+
+<Note>
+  Configuration errors (calling `jaz.configure()` with wrong types, invalid template paths, etc.) raise standard Python builtins — `ValueError`, `TypeError`, or `jinja2.TemplateSyntaxError` — not `JazException` subclasses. The taxonomy below covers errors that occur during agent execution.
+</Note>
+
+---
+
+## Base Classes
+
+<Accordion title="JazException — the taxonomy root">
+
+**`JazException(Exception)`**
+
+The root of the JAZ exception hierarchy. Every error JAZ raises is a subclass of this and therefore also an `Exception`. Use `except JazException` as a framework-wide catch-all.
+
+```python
+try:
+    result = jaz.invoke(task="...")
+except JazException as e:
+    print(f"JAZ failed: {e}")
+```
+
+</Accordion>
+
+<Accordion title="FatalError — errors that end the entire invoke tree">
+
+**`FatalError(JazException)`**
+
+A fatal error bypasses the agent's error-recovery loop and propagates out of `jaz.invoke()` to the caller. While an ordinary exception in REPL code is shown to the agent as recoverable feedback, a `FatalError` ends the REPL session immediately and causes the invoke to error out.
+
+If a fatal error occurs inside a sub-invoke (recursive `invoke` call), it propagates up through every parent invoke until it reaches the top-level `jaz.invoke()` call, which raises it to your code.
+
+**When to use it:** Raise `FatalError` from a tool definition when the failure is unrecoverable — for example, a required external service is unavailable, or a security check failed that should never be retried.
+
+```python
+from jaz.exceptions import FatalError
+
+def my_tool(query: str) -> str:
+    if not check_credentials():
+        raise FatalError("Credentials are invalid — cannot proceed.")
+    return call_api(query)
+```
+
+**Who can catch it:**
+
+| Caller | Can catch? |
+|--------|-----------|
+| Agent REPL code | **No** — `FatalError` is injected as un-catchable by the AST transform |
+| Your tool code / host code | **Yes** — by catching it explicitly |
+| A hook | **No** — propagates during unwind; no transform boundary fires |
+
+**Known limitations:** A suppressing context manager (`__exit__` returning `True`) can still swallow a `FatalError` in the default configuration. An `ExceptionGroup` containing a `FatalError` is catchable by `except ExceptionGroup`, though `except*` cannot swallow it.
+
+</Accordion>
+
+---
+
+## Agent Execution Errors
+
+These errors are raised during an agent run in response to REPL code execution, budget limits, or hook conditions.
+
+<Accordion title="ReturnTypeError — wrong return type">
+
+**`ReturnTypeError(TypeError, JazException)`**
+
+Raised when the agent's returned value does not satisfy the declared return type annotation. Produced by the `jaz.hooks.ReturnType` hook: the mismatched `return` is downgraded to a `Continue` carrying this error, so the agent is told what went wrong and can retry.
+
+```python
+try:
+    result = jaz.invoke(task="Return the count.", hooks=[ReturnType(int)])
+except ReturnTypeError as e:
+    # The agent never returned a valid int
+    print(e)
+```
+
+</Accordion>
+
+<Accordion title="SandboxPermissionError — filesystem access denied">
+
+**`SandboxPermissionError(JazException)`**
+
+Raised when the REPL filesystem sandbox denies a file operation because the path is outside the configured `allowed_read_paths` or `allowed_write_paths`. The message names the offending path and the permission it lacked.
+
+```python
+from jaz.exceptions import SandboxPermissionError
+
+try:
+    result = jaz.invoke(task="Read /etc/passwd")
+except SandboxPermissionError as e:
+    print(f"File access blocked: {e}")
+```
+
+</Accordion>
+
+<Accordion title="BudgetExhaustedError — budget or iteration cap reached">
+
+**`BudgetExhaustedError(JazException)`**
+
+Base for the two distinct budget-exhaustion causes. Catch this to handle either, or the subclass to distinguish them.
+
+**`IterationLimitExhaustedError(BudgetExhaustedError)`**
+
+Raised by `jaz.hooks.IterationLimit` when the per-invoke turn cap is reached. Granting more turns (re-invoking with a higher limit) can let the run finish.
+
+**`BudgetPoolExhaustedError(BudgetExhaustedError)`**
+
+Raised by `jaz.hooks.BudgetPool` when its pooled cost or call-count ceiling is reached. More turns cannot refill a spent pool — the budget must be reset or increased at configuration level.
+
+```python
+from jaz.exceptions import (
+    BudgetExhaustedError,
+    IterationLimitExhaustedError,
+    BudgetPoolExhaustedError,
+)
+
+try:
+    result = jaz.invoke(task="...", hooks=[IterationLimit(10)])
+except IterationLimitExhaustedError:
+    print("Agent needed more turns — consider raising the limit.")
+except BudgetPoolExhaustedError:
+    print("Cost or call budget spent.")
+except BudgetExhaustedError:
+    print("Some budget was exhausted.")
+```
+
+</Accordion>
+
+<Accordion title="RecursionLimitError — sub-invoke depth exceeded">
+
+**`RecursionLimitError(JazException)`**
+
+Raised when a `jaz.invoke()` call from within an agent exceeds the recursion depth limit set by `jaz.hooks.RecursionLimit`. The framework itself imposes no recursion cap; this error only occurs when `RecursionLimit` is installed.
+
+</Accordion>
+
+<Accordion title="BudgetForcingError — early finish blocked">
+
+**`BudgetForcingError(JazException)`**
+
+Raised by the `jaz.hooks.BudgetForcing` hook when it blocks an early `return` or `raise` finish — for example, when the hook requires the agent to spend more iterations before concluding.
+
+</Accordion>
+
+<Accordion title="REPLInputConflictError — variable name collision">
+
+**`REPLInputConflictError(ValueError, JazException)`**
+
+Raised when an added variable name conflicts with one that is already bound. Covers three cases: two hook effects adding the same name with different values, an `AddInputs` key colliding with a caller's own input or scope entry, or an `AddVariables` name already present in the REPL namespace. Identical values coalesce instead of raising.
+
+Also a `ValueError`, so `except ValueError` catches it.
+
+</Accordion>
+
+<Accordion title="REPLTimeoutPragmaError — malformed timeout comment">
+
+**`REPLTimeoutPragmaError(ValueError, JazException)`**
+
+Raised when the agent writes a `# timeout:` pragma in the opening lines of its code but the value is not a positive, finite number of seconds. Examples that raise: `# timeout: 0`, `# timeout: 120s`, `# timeout: infinity`. The offending code is not executed — the agent sees the error as ordinary feedback and can correct it.
+
+Valid usage: `# timeout: 120` (a positive integer or float, optionally followed by a `#` comment).
+
+Also a `ValueError`.
+
+</Accordion>
+
+<Accordion title="SandboxKeyError — forbidden namespace key">
+
+**`SandboxKeyError(ValueError, JazException)`**
+
+Raised when a hook effect names the compiler-sandbox key `__builtins__` in an `AddVariables`, `AddInputs`, or `DropVariables` effect. `__builtins__` holds the sandbox allow-lists; binding or dropping it would reopen the sandbox. Raised at composition time (before execution) so the offending effect is surfaced immediately.
+
+Also a `ValueError`.
+
+</Accordion>
+
+<Accordion title="MissingDropTargetError — dropping an absent variable">
+
+**`MissingDropTargetError(KeyError, JazException)`**
+
+Raised when a `DropVariables` or `DropInputs` effect names a variable that is not currently bound in the REPL namespace. Dropping an absent name is treated as a hook bug (a typo, or a re-drop-every-turn pattern that should be first-turn-only). Set `allow_missing=True` on the effect for a deliberately defensive drop that tolerates absence.
+
+Also a `KeyError`.
+
+</Accordion>
+
+---
+
+## Hook and Composition Errors
+
+These errors indicate a bug in hook configuration or effect composition.
+
+<Accordion title="InvalidEffectError — wrong effect for the event">
+
+**`InvalidEffectError(JazException)`**
+
+Raised when a hook returns an effect at an event stage that does not accept it. Every event documents which effects are valid at its stage; an out-of-stage effect is rejected loudly rather than silently ignored. The message names the offending effect kind and the event.
+
+</Accordion>
+
+<Accordion title="HookActivationError — double-activating a hook">
+
+**`HookActivationError(JazException)`**
+
+Raised when a single `Hook` instance is activated by more than one path simultaneously — for example, `with my_hook: jaz.invoke(my_hook, ...)` (both `with` and positional), or listing the same instance twice as a positional hook. A hook instance must be active via exactly one path at a time.
+
+</Accordion>
+
+<Accordion title="ConfigOverrideActivationError — re-entering a ConfigOverride">
+
+**`ConfigOverrideActivationError(JazException)`**
+
+Raised when a single `ConfigOverride` instance is entered while already active. Distinct `ConfigOverride` instances nest freely; only overlapping reuse of the same instance is forbidden.
+
+</Accordion>
+
+<Accordion title="LLMResponseConflictError — conflicting LLM response supplies">
+
+**`LLMResponseConflictError(JazException)`**
+
+Raised when two hooks compose conflicting LLM response values for the same query — either two `SupplyLLMResponse` effects with different responses, or two `ModifyLLMResponse` effects setting the same field to different values. Identical values coalesce; distinct ones raise because resolution by hook order would be non-deterministic.
+
+</Accordion>
+
+<Accordion title="ReturnValueConflictError — conflicting return values">
+
+**`ReturnValueConflictError(JazException)`**
+
+Raised when effects carrying distinct `Return` values fold at one boundary (`SupplyExecResult`, `ModifyExecResult`, `ModifyInvokeResult`). Carried `Continue` results merge (outputs concatenate, exceptions group) and identical return values coalesce, but two different return values cannot be combined without picking a winner by hook order.
+
+</Accordion>
+
+<Accordion title="BlackboardSeedError — invalid blackboard seed">
+
+**`BlackboardSeedError(JazException)`**
+
+Raised during per-invoke blackboard assembly (before `InvokeEnter` is dispatched) when a seed key has no consumer hook (`blackboard_consumes`) — likely a typo or an orphan datum — or when two hooks seed the same key with different values.
+
+</Accordion>
+
+<Accordion title="BlackboardWriteConflictError — conflicting blackboard writes">
+
+**`BlackboardWriteConflictError(JazException)`**
+
+Raised when two `BlackboardWrite` effects in the same event write the same key with different values. Identical writes coalesce; distinct ones raise, since within one event there is no order-independent resolution.
+
+</Accordion>
+
+<Accordion title="MessageEditIndexError — message index out of range">
+
+**`MessageEditIndexError(IndexError, JazException)`**
+
+Raised when a `DropMessages` or `AddMessages` effect specifies an index outside the valid range of the message list snapshot the hook saw. Follows list semantics: negative indices count from the end; `index == len` is a valid append position for adds. Out-of-range raises rather than being clamped.
+
+Also an `IndexError`.
+
+</Accordion>
+
+<Accordion title="ModelPricingUnavailableError — unpriced model with cost budget">
+
+**`ModelPricingUnavailableError(JazException)`**
+
+Raised by `jaz.hooks.BudgetPool` when a `cost_budget` is set but no per-call cost is available for the configured model. The usual cause is a model missing from the bundled price table. Use `calls_budget` instead (counts LLM calls, no pricing needed), or update the price table.
+
+</Accordion>
+
+<Accordion title="NonMonotoneRolloutError — non-append-only trajectory">
+
+**`NonMonotoneRolloutError(JazException)`**
+
+Raised by `Rollout.to_flat()` when the trajectory's context was not append-only — for example, a reasoning model whose `<think>` blocks are stripped between turns, or a transient hook nudge. Use `to_pieces()` or `to_turn_samples()` instead.
+
+</Accordion>
+
+---
+
+## LLM Provider Errors
+
+These errors are raised by the LLM layer and normalized into the JAZ taxonomy. They keep LiteLLM's exception names for one-to-one translation. All are subclasses of `LLMError`, which is itself a `JazException`.
+
+```python
+from jaz.exceptions import (
+    LLMError,
+    RateLimitError,
+    AuthenticationError,
+    ContextWindowExceededError,
+    ContentPolicyViolationError,
+    NotFoundError,
+    PermissionDeniedError,
+    UnsupportedParamsError,
+    APIError,
+)
+
+try:
+    result = jaz.invoke(task="...")
+except RateLimitError:
+    time.sleep(60)
+    result = jaz.invoke(task="...")  # retry after back-off
+except AuthenticationError:
+    raise  # key is wrong — no point retrying
+except LLMError as e:
+    print(f"Provider error ({e.status_code}): {e.message}")
+```
+
+`LLMError` instances carry three attributes:
+
+<ResponseField name="message" type="str">
+  Human-readable error message from the provider.
+</ResponseField>
+
+<ResponseField name="status_code" type="int | None">
+  HTTP status code, or `None` when not applicable.
+</ResponseField>
+
+<ResponseField name="llm_provider" type="str | None">
+  Provider identifier string, or `None`.
+</ResponseField>
+
+<Accordion title="RateLimitError — API rate limit exceeded">
+
+**`RateLimitError(LLMError)`**
+
+The provider returned a rate-limit response. **Retryable** — back off and retry.
+
+</Accordion>
+
+<Accordion title="AuthenticationError — invalid credentials">
+
+**`AuthenticationError(LLMError)`**
+
+The provider rejected the API key or credentials. **Not retryable** — fix the key.
+
+</Accordion>
+
+<Accordion title="ContextWindowExceededError — prompt too long">
+
+**`ContextWindowExceededError(LLMError)`**
+
+The input exceeded the model's context window. **Not retryable** with the same input — reduce prompt length or switch to a model with a larger context window.
+
+</Accordion>
+
+<Accordion title="ContentPolicyViolationError — prompt blocked by policy">
+
+**`ContentPolicyViolationError(LLMError)`**
+
+The provider's content or safety policy rejected the prompt (typically a 400 response). **Not retryable** with identical input. Note: provider refusals surfaced on a 200 response (e.g. Anthropic `stop_reason="refusal"`) are not represented by this error.
+
+</Accordion>
+
+<Accordion title="NotFoundError — model or endpoint not found">
+
+**`NotFoundError(LLMError)`**
+
+The provider returned 404. The two most likely causes are an incorrect model name, or a wrong `base_url` (when pointing at a proxy, vLLM, or Ollama). The error message includes the URL to help distinguish them. **Not retryable** — fix the model name or base URL.
+
+</Accordion>
+
+<Accordion title="PermissionDeniedError — API key lacks permission">
+
+**`PermissionDeniedError(LLMError)`**
+
+The provider returned 403 — the API key is valid but lacks permission for this operation or model (wrong project/org scope, a restricted key). **Not retryable** without granting the necessary permissions.
+
+</Accordion>
+
+<Accordion title="UnsupportedParamsError — unsupported request parameters">
+
+**`UnsupportedParamsError(LLMError)`**
+
+The request included parameters the provider does not support. **Not retryable** — remove or correct the unsupported parameters.
+
+</Accordion>
+
+<Accordion title="APIError — generic server-side error">
+
+**`APIError(LLMError)`**
+
+A server-side error with no more specific class. May or may not be retryable depending on the underlying cause.
+
+</Accordion>
+
+---
+
+## Warnings
+
+JAZ emits Python warnings (subclasses of `UserWarning`) for conditions that are not errors but may indicate a problem. Filter them with the standard `warnings` module.
+
+<Accordion title="NonPublicAPIWarning — accessing non-public names">
+
+**`NonPublicAPIWarning(UserWarning)`**
+
+Emitted when a name absent from a module's `__all__` is accessed via the package. The name is reachable but its interface is unstable (experimental, may change, or may be removed).
+
+```python
+import warnings
+import jaz
+
+# Silence it
+warnings.simplefilter("ignore", jaz.exceptions.NonPublicAPIWarning)
+
+# Or make it a hard error
+warnings.simplefilter("error", jaz.NonPublicAPIWarning)
+```
+
+</Accordion>
+
+<Accordion title="DescriptionRetentionWarning — too many described values">
+
+**`DescriptionRetentionWarning(UserWarning)`**
+
+Emitted when `jaz.describe()` has retained many un-collectable values. Bare built-ins (`list`, `dict`, `int`, ...) cannot hold their own description so `jaz.describe()` keeps a strong reference to them for the lifetime of the process; these are never garbage-collected. Emitted once the retained count crosses a threshold, then again at each doubling.
+
+**Fix:** Describe a container object that holds the built-in rather than the built-in itself, or hoist `describe()` out of the loop.
+
+```python
+import warnings, jaz
+warnings.simplefilter("ignore", jaz.exceptions.DescriptionRetentionWarning)
+```
+
+</Accordion>
+
+<Accordion title="DescriptionSharedValueWarning — describing a process-wide singleton">
+
+**`DescriptionSharedValueWarning(UserWarning)`**
+
+Emitted on the **first** call when `jaz.describe()` is called on a value CPython shares process-wide: `None`, `True`/`False`, or small integers (−5 to 256). Describing one of these attaches a description to every occurrence of that value across your entire program.
+
+```python
+# Bug: this labels *every* 42 in every invoke, not just your `limit` input
+jaz.describe(42, "row count")
+jaz.invoke(task="...", limit=42)  # `limit` renders as "row count"
+```
+
+**Fix:** Describe a wrapper object, or pass the label via `jaz.Display` at the call site.
+
+```python
+import warnings, jaz
+warnings.simplefilter("ignore", jaz.exceptions.DescriptionSharedValueWarning)
+```
+
+</Accordion>
+
+<Accordion title="UnknownRequestParamWarning — possible typo in LLM kwarg">
+
+**`UnknownRequestParamWarning(UserWarning)`**
+
+Emitted when a backend construction keyword argument closely matches a known request parameter but is unrecognized. For example, `LiteLLM(temperatrue=0.7)` warns that `temperatrue` looks like `temperature`. The kwarg is still forwarded (arbitrary provider-specific extras are supported), but the warning surfaces likely typos.
+
+```python
+import warnings, jaz
+warnings.simplefilter("error", jaz.exceptions.UnknownRequestParamWarning)
+```
+
+</Accordion>
+
+---
+
+## Catching Examples
+
+<Tabs>
+  <Tab title="Catch any JAZ error">
+    ```python
+    import jaz
+    from jaz.exceptions import JazException
+
+    try:
+        result = jaz.invoke(task="Compute something.")
+    except JazException as e:
+        print(f"Agent run failed: {type(e).__name__}: {e}")
+    ```
+  </Tab>
+  <Tab title="Handle budget and LLM errors">
+    ```python
+    import jaz
+    from jaz.exceptions import (
+        IterationLimitExhaustedError,
+        RateLimitError,
+        AuthenticationError,
+        LLMError,
+    )
+    import time
+
+    for attempt in range(3):
+        try:
+            result = jaz.invoke(task="...", hooks=[IterationLimit(20)])
+            break
+        except IterationLimitExhaustedError:
+            print("Ran out of turns — consider a simpler task.")
+            break
+        except RateLimitError:
+            print(f"Rate limited; backing off (attempt {attempt + 1})")
+            time.sleep(30 * (attempt + 1))
+        except AuthenticationError:
+            raise  # No point retrying
+        except LLMError as e:
+            print(f"Provider error: {e.message}")
+            break
+    ```
+  </Tab>
+  <Tab title="Handle fatal errors from tools">
+    ```python
+    import jaz
+    from jaz.exceptions import FatalError
+
+    def fragile_tool(query: str) -> str:
+        response = call_external_service(query)
+        if response is None:
+            raise FatalError("External service is unavailable.")
+        return response
+
+    try:
+        result = jaz.invoke(task="Query the service.", tool=fragile_tool)
+    except FatalError as e:
+        print(f"Unrecoverable failure: {e}")
+    ```
+  </Tab>
+</Tabs>

@@ -1,0 +1,595 @@
+---
+title: "Hook Effects Reference: Influencing Agent Execution"
+sidebarTitle: "Effects"
+description: "Complete reference for all JAZ hook effects — valid stages, composition rules, and examples for every effect type a hook handler can return."
+---
+
+Effects are the typed values a hook handler returns to influence the agent run. The framework collects all active hooks' effects after each event, composes them **order-independently**, and applies them. A hook that returns `[]` everywhere is a pure observer. Returning an effect at a stage that does not accept it raises `InvalidEffectError` — there is no silent no-op.
+
+<Note>
+The hook system is **experimental**. Effect interfaces may change in a future release.
+</Note>
+
+## Import path
+
+```python
+from jaz.hooks.effects import (
+    # Invoke-input effects
+    AddInputs, DropInputs,
+    # Recursion control
+    DisableRecursion,
+    # Message effects
+    AddMessages, DropMessages,
+    # Variable effects
+    AddVariables, DropVariables,
+    # Code editing effects
+    InsertCode, DeleteCode,
+    # Supply effects (skipping work)
+    SupplyLLMResponse, SupplyExecResult, SupplyInvokeResult,
+    # Modify effects (transforming results)
+    ModifyExecResult, ModifyInvokeResult, ModifyLLMResponse,
+    # Universal control
+    Abort,
+    # Cross-hook coordination
+    BlackboardWrite,
+    # Base class and sentinel
+    Effect, UNSET,
+)
+```
+
+## Effect validity by stage
+
+```
+Enter    (edit the proposal)     InvokeEnter:    AddInputs, DropInputs, DisableRecursion
+                                  LLMQueryEnter:  AddMessages, DropMessages
+                                  REPLExecEnter:  AddVariables, DropVariables, InsertCode, DeleteCode
+
+Send     (supply the result,     LLMQuerySend:   SupplyLLMResponse
+          skipping the work)     REPLExecSend:   SupplyExecResult
+                                  InvokeSend:     SupplyInvokeResult
+
+Complete (transform the raw      REPLExecComplete:   ModifyExecResult
+          result)                InvokeComplete:     ModifyInvokeResult
+                                  LLMQueryComplete:  ModifyLLMResponse
+
+Exit     (observe the outcome)   LLMQueryExit / REPLExecExit: Abort (every arm)
+                                  InvokeExit: observation-only (no effects)
+```
+
+`Abort` is also valid at every `*Enter`, `*Send`, and `*Complete` event above. `BlackboardWrite` is valid at **every** event including every `*Exit`.
+
+---
+
+## Invoke-input effects
+
+### `AddInputs`
+
+Add inputs to the invoke — equivalent to adding more `name=value` keyword arguments to `jaz.invoke`. Each entry both renders in the user prompt and binds as a REPL variable.
+
+**Valid at:** `InvokeEnter`
+
+<ParamField path="inputs" type="dict[str, object]" required>
+  Name-to-value pairs to add. Each renders in the prompt and binds in the REPL. Values resolve through the `__jaz_get__` protocol.
+</ParamField>
+
+**Composition:** All `inputs` are unioned. The same key with the same value coalesces; a different value raises `REPLInputConflictError`. A key colliding with an existing invoke input raises unless a `DropInputs` at the same invoke names it first (which clears it, making the pair a replacement). `__builtins__` raises `SandboxKeyError`.
+
+```python
+from jaz.hooks.effects import AddInputs
+from jaz.hooks.events import InvokeEnter
+
+def on_invoke_enter(self, event: InvokeEnter) -> list[Effect]:
+    return [AddInputs({"api_config": {"timeout": 30}})]
+```
+
+---
+
+### `DropInputs`
+
+Remove invoke inputs by name — equivalent to un-passing keyword arguments from `jaz.invoke`. Removes from both the prompt and the REPL namespace.
+
+**Valid at:** `InvokeEnter`
+
+<ParamField path="keys" type="set[str]" required>
+  The input names to un-pass.
+</ParamField>
+
+<ParamField path="allow_missing" type="bool" default="False">
+  When `True`, dropping a key the invoke never received is tolerated rather than raising `MissingDropTargetError`.
+</ParamField>
+
+**Composition:** `keys` are unioned across all drops, order-independently. Drops are applied before any `AddInputs`.
+
+```python
+from jaz.hooks.effects import DropInputs
+
+# Remove a secret from the prompt/REPL before the agent sees it.
+return [DropInputs({"secret_token"})]
+```
+
+---
+
+### `DisableRecursion`
+
+Withhold the recursive `jaz.invoke` tool from this invoke. The agent never sees the `invoke` name in its REPL at all.
+
+**Valid at:** `InvokeEnter`
+
+**Composition:** A pure signal — emitting it more than once is the same as emitting it once.
+
+```python
+from jaz.hooks.effects import DisableRecursion
+from jaz.hooks.events import InvokeEnter
+
+def on_invoke_enter(self, event: InvokeEnter) -> list[Effect]:
+    # Prevent sub-delegation at this depth.
+    if event.depth >= 2:
+        return [DisableRecursion()]
+    return []
+```
+
+---
+
+## Message effects
+
+### `AddMessages`
+
+Insert messages into the conversation before an LLM query. By default appends; set `index` to insert before a specific slot.
+
+**Valid at:** `LLMQueryEnter`
+
+<ParamField path="messages" type="list[MessageDict]" required>
+  The messages to insert.
+</ParamField>
+
+<ParamField path="index" type="int | None" default="None">
+  Slot to insert before. `None` appends. Negative counts from the end. Out-of-range raises `MessageEditIndexError`.
+</ParamField>
+
+<ParamField path="persistent" type="bool" default="False">
+  `True` keeps the add in the conversation buffer for all subsequent turns; `False` applies to this turn's message list only.
+</ParamField>
+
+<ParamField path="sort_key" type="float" default="0.0">
+  Orders adds landing in the same slot; lower comes first.
+</ParamField>
+
+**Composition:** Adds at distinct slots are independent; same-slot adds are ordered by `sort_key`, ties broken by canonical content serialization.
+
+```python
+from jaz.hooks.effects import AddMessages
+from jaz.hooks.events import LLMQueryEnter
+
+def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+    if event.iteration == 0:
+        # Inject a persistent system-level instruction on the first turn.
+        return [AddMessages(
+            [{"role": "user", "content": "Always explain your reasoning."}],
+            persistent=True,
+        )]
+    return []
+```
+
+---
+
+### `DropMessages`
+
+Drop messages by index from the list sent to the model.
+
+**Valid at:** `LLMQueryEnter`
+
+<ParamField path="indices" type="set[int]" required>
+  Positions to drop from the message list. Negative indices count from the end. Out-of-range raises `MessageEditIndexError`.
+</ParamField>
+
+<ParamField path="persistent" type="bool" default="False">
+  `True` also removes the message from the carried-forward conversation buffer; `False` drops it only from this turn's view.
+</ParamField>
+
+**Composition:** Multiple drops compose by **union** of their indices — order-independent.
+
+```python
+from jaz.hooks.effects import DropMessages
+
+# Drop the first message from this turn's prompt view only.
+return [DropMessages({0})]
+```
+
+---
+
+## Variable effects
+
+### `AddVariables`
+
+Bind names into the agent's REPL namespace before a turn's code runs. Does not touch the prompt.
+
+**Valid at:** `REPLExecEnter`
+
+<ParamField path="variables" type="dict[str, object]" required>
+  Name-to-value pairs to bind in the REPL namespace. Bound raw (no `__jaz_get__` substitution).
+</ParamField>
+
+**Composition:** All `variables` are unioned. Identical `(name, value)` coalesces; a divergent value for the same name raises `REPLInputConflictError`. `__builtins__` raises `SandboxKeyError`. Drops are applied before adds, so pairing a `DropVariables` with an `AddVariables` re-binds a name.
+
+```python
+from jaz.hooks.effects import AddVariables
+from jaz.hooks.events import REPLExecEnter
+
+def on_repl_exec_enter(self, event: REPLExecEnter) -> list[Effect]:
+    if event.iteration == 0:
+        return [AddVariables({"scratch": {}, "tools": my_tool_registry})]
+    return []
+```
+
+---
+
+### `DropVariables`
+
+Remove names from the agent's REPL namespace before a turn's code runs. Reaches any name currently bound — invoke inputs, earlier assignments, framework magic like `__history__`.
+
+**Valid at:** `REPLExecEnter`
+
+<ParamField path="names" type="set[str]" required>
+  The REPL names to unbind.
+</ParamField>
+
+<ParamField path="allow_missing" type="bool" default="False">
+  When `True`, dropping an unbound name is tolerated rather than raising `MissingDropTargetError`.
+</ParamField>
+
+**Composition:** `names` are combined into one set, applied once.
+
+```python
+from jaz.hooks.effects import DropVariables
+
+# Hide the REPL history list from the agent this turn.
+return [DropVariables({"__history__"})]
+```
+
+---
+
+## Code editing effects
+
+### `InsertCode`
+
+Insert source into the proposed REPL code before it runs. Anchored to the **original** proposed code (from `REPLExecEnter.code`), so composition is order-independent.
+
+**Valid at:** `REPLExecEnter`
+
+<ParamField path="text" type="str" required>
+  The source to insert.
+</ParamField>
+
+<ParamField path="at" type="int" required>
+  Character offset to insert before, in `[0, len]` of the original code. Negative counts from the end. Out-of-range raises `CodeEditOffsetError`.
+</ParamField>
+
+<ParamField path="sort_key" type="float" default="0.0">
+  Orders inserts that share an offset (lower first), ties broken by inserted text.
+</ParamField>
+
+```python
+from jaz.hooks.effects import InsertCode
+
+# Prepend an import to every turn's code.
+return [InsertCode(text="import json\n", at=0)]
+```
+
+---
+
+### `DeleteCode`
+
+Delete a character range from the proposed REPL code before it runs. Anchored to the original proposed code; overlapping ranges from multiple hooks union.
+
+**Valid at:** `REPLExecEnter`
+
+<ParamField path="start" type="int" required>
+  First offset to delete (inclusive). Negative counts from the end.
+</ParamField>
+
+<ParamField path="end" type="int" required>
+  Offset one past the last character to delete (exclusive). `start == end` deletes nothing. Out-of-range or `start > end` raises `CodeEditOffsetError`.
+</ParamField>
+
+```python
+from jaz.hooks.effects import DeleteCode
+
+# Delete characters 0-5 from the proposed code.
+return [DeleteCode(start=0, end=5)]
+```
+
+---
+
+## Supply effects
+
+Supply effects skip the work for a span — providing a result directly without calling the LLM or running the REPL.
+
+### `SupplyLLMResponse`
+
+Supply a pre-computed LLM response, skipping the API call. The query completes normally with the supplied response, so `LLMQueryComplete` and `LLMQueryExit` still fire.
+
+**Valid at:** `LLMQuerySend`
+
+<ParamField path="content" type="str | None" required>
+  The response text.
+</ParamField>
+
+<ParamField path="prompt_tokens" type="int | None" default="None">
+  Input token count to record.
+</ParamField>
+
+<ParamField path="completion_tokens" type="int | None" default="None">
+  Output token count to record.
+</ParamField>
+
+<ParamField path="cached_tokens" type="int | None" default="None">
+  Cached-input token count (subset of `prompt_tokens`).
+</ParamField>
+
+<ParamField path="cost_usd" type="float | None" default="None">
+  Cost in USD to record for this call.
+</ParamField>
+
+<ParamField path="extra" type="dict[str, Any] | None" default="None">
+  Provider-specific metrics. `None` yields an empty dict.
+</ParamField>
+
+<ParamField path="raw_response" type="Any" default="None">
+  The raw provider payload a protocol may read (tool calls / finish reason).
+</ParamField>
+
+<ParamField path="tokens" type="TurnRecord | None" default="None">
+  Per-turn token record for a token-native backend.
+</ParamField>
+
+**Composition:** Identical supplies coalesce; two distinct supplies raise `LLMResponseConflictError`.
+
+```python
+from jaz.hooks.effects import SupplyLLMResponse
+from jaz.hooks.events import LLMQuerySend
+
+def on_llm_query_send(self, event: LLMQuerySend) -> list[Effect]:
+    # Return a cached response if available.
+    cached = self._cache.get(tuple(m["content"] for m in event.messages))
+    if cached:
+        return [SupplyLLMResponse(content=cached, cost_usd=0.0)]
+    return []
+```
+
+---
+
+### `SupplyExecResult`
+
+Supply a result in place of running the turn's code. The code is not executed; the supplied result becomes the turn's outcome. `REPLExecComplete` and `REPLExecExit` still fire with it.
+
+**Valid at:** `REPLExecSend`
+
+<ParamField path="result" type="Continue | Return | Raise" required>
+  The result to use instead of executing. For a `Continue`, render any error into `output` — that is the only surface the agent sees.
+</ParamField>
+
+**Composition:** Multiple supplies fold by kind precedence: `Raise` > `Return` > `Continue`. Two distinct `Return` values raise `ReturnValueConflictError`; identical values coalesce. `Continue` results concatenate their outputs and group their exceptions.
+
+```python
+from jaz.hooks.effects import SupplyExecResult
+from jaz.repl.types import Continue
+
+# Reject code that looks dangerous before it runs.
+return [SupplyExecResult(result=Continue(
+    output="Error: unsafe code detected — execution blocked.",
+    exception=ValueError("blocked"),
+))]
+```
+
+---
+
+### `SupplyInvokeResult`
+
+Supply the invoke's terminal result, skipping the entire agent loop. The result must be terminal (`Return` or `Raise`). The invoke-transform boundary (`InvokeComplete`) still fires, so `ModifyInvokeResult` / `ReturnType` / `ValidateReturn` backstops still apply.
+
+**Valid at:** `InvokeSend`
+
+<ParamField path="result" type="Return | Raise" required>
+  The terminal result to use instead of running the invoke. `Continue` is rejected at construction.
+</ParamField>
+
+---
+
+## Modify effects
+
+Modify effects transform a result that already exists at the `*Complete` boundary.
+
+### `ModifyExecResult`
+
+Replace the execution result with a different one. Can downgrade a terminal `Return` / `Raise` to a `Continue` (forcing another turn) or upgrade a `Continue` to a terminal.
+
+**Valid at:** `REPLExecComplete`
+
+<ParamField path="result" type="Continue | Return | Raise" required>
+  The replacement result.
+</ParamField>
+
+**Composition:** Multiple transforms fold by kind precedence (`Raise` > `Return` > `Continue`). A `Continue` transform concatenates its output onto the original's (when the original is also a `Continue`) and groups exceptions.
+
+```python
+from jaz.hooks.effects import ModifyExecResult
+from jaz.repl.types import Continue, Return
+from jaz.hooks.events import REPLExecComplete
+
+def on_repl_exec_complete(self, event: REPLExecComplete) -> list[Effect]:
+    # Force the agent to keep working if it returns too early.
+    if isinstance(event.exec_result, Return) and not self._budget_spent():
+        return [ModifyExecResult(result=Continue(
+            output="Please explore further before returning.",
+        ))]
+    return []
+```
+
+---
+
+### `ModifyInvokeResult`
+
+Replace the invoke's terminal result. The carried result must be terminal (`Return` or `Raise`) — `Continue` is rejected at construction because the agent loop has already finished.
+
+**Valid at:** `InvokeComplete`
+
+<ParamField path="result" type="Return | Raise" required>
+  The terminal replacement result.
+</ParamField>
+
+```python
+from jaz.hooks.effects import ModifyInvokeResult
+from jaz.repl.types import Raise
+from jaz.hooks.events import InvokeComplete
+
+def on_invoke_complete(self, event: InvokeComplete) -> list[Effect]:
+    from jaz.repl.types import Return
+    if isinstance(event.result, Return) and not self._is_valid(event.result.return_value):
+        return [ModifyInvokeResult(result=Raise(exception=ValueError("invalid return")))]
+    return []
+```
+
+---
+
+### `ModifyLLMResponse`
+
+Transform the LLM response after the call returned. A **partial override** — fields default to `UNSET` meaning "leave the original untouched". The transform is authoritative: the agent acts on the modified response, and `LLMQueryExit` observers see the post-transform value.
+
+**Valid at:** `LLMQueryComplete`
+
+<ParamField path="content" type="str | None | UNSET" default="UNSET">
+  Replacement response text. `UNSET` keeps the original; `None` sets a null completion.
+</ParamField>
+
+<ParamField path="prompt_tokens" type="int | None | UNSET" default="UNSET">
+  Replacement input token count.
+</ParamField>
+
+<ParamField path="completion_tokens" type="int | None | UNSET" default="UNSET">
+  Replacement output token count.
+</ParamField>
+
+<ParamField path="cached_tokens" type="int | None | UNSET" default="UNSET">
+  Replacement cached-input token count.
+</ParamField>
+
+<ParamField path="cost_usd" type="float | None | UNSET" default="UNSET">
+  Replacement cost in USD. Re-prices the cost booked at `LLMQueryExit`.
+</ParamField>
+
+<ParamField path="extra" type="dict[str, Any] | UNSET" default="UNSET">
+  Replacement provider-metrics dict (replaces wholesale).
+</ParamField>
+
+<ParamField path="raw_response" type="Any" default="UNSET">
+  Replacement raw provider payload. `None` clears it.
+</ParamField>
+
+<ParamField path="tokens" type="TurnRecord | None | UNSET" default="UNSET">
+  Replacement per-turn token record. `None` clears it.
+</ParamField>
+
+**Composition:** Field-wise merge — for each field, the single non-`UNSET` value wins; two effects setting the same field to different values raise `LLMResponseConflictError` (identical values coalesce). A content-redacting hook and a re-pricing hook compose cleanly because they touch disjoint fields.
+
+```python
+from jaz.hooks.effects import ModifyLLMResponse, UNSET
+from jaz.hooks.events import LLMQueryComplete
+
+def on_llm_query_complete(self, event: LLMQueryComplete) -> list[Effect]:
+    # Redact PII from the response content while preserving tokens/cost.
+    clean = self._redact(event.response.content)
+    if clean != event.response.content:
+        return [ModifyLLMResponse(content=clean)]  # all other fields stay UNSET → kept
+    return []
+```
+
+---
+
+## Universal control
+
+### `Abort`
+
+Abort **this invoke**: `error` propagates out of `jaz.invoke()` as a raised exception. The aborting invoke's spans close with `Aborted` on their `*Exit` events.
+
+**Valid at:** Every `*Enter`, `*Send`, and `*Complete` event; `LLMQueryExit` and `REPLExecExit` on every arm (on `Aborted`/`Failed` arms, folded into the in-flight exception via `ExceptionGroup`). `InvokeExit` stays observation-only.
+
+<ParamField path="error" type="Exception" required>
+  The exception to abort the invoke with.
+</ParamField>
+
+**Composition:** Highest precedence — supersedes all result/supply/modify effects at the same stage. Multiple `Abort` effects group their exceptions into an `ExceptionGroup`.
+
+**Scope:** Exactly the invoke it fires in. How far the stop travels is determined by the carried exception's category: a parent invoke sees an aborted child as an ordinary recoverable error in its REPL, unless the exception is `FatalError`-category (which re-raises past every agent in the tree).
+
+```python
+from jaz.hooks.effects import Abort
+from jaz.exceptions import BudgetPoolExhaustedError
+from jaz.hooks.events import LLMQueryEnter
+
+def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+    if self._total_cost >= self._limit:
+        return [Abort(error=BudgetPoolExhaustedError(
+            f"Cost limit ${self._limit:.2f} exceeded"
+        ))]
+    return []
+```
+
+---
+
+## Cross-hook coordination
+
+### `BlackboardWrite`
+
+Write a key/value into the per-invoke blackboard. Valid at **any** event — the blackboard spans the whole invoke rather than one context.
+
+**Valid at:** Every event, including every `*Exit`.
+
+<ParamField path="key" type="str" required>
+  The blackboard key to write.
+</ParamField>
+
+<ParamField path="value" type="object" required>
+  The value to publish under that key.
+</ParamField>
+
+**Timing:** Writes are applied **after** every hook has run for an event, so a write is invisible to the event that produced it and surfaces to the next one. This keeps producer/consumer hooks order-independent.
+
+**Composition:** Identical writes coalesce; two writes to the same key with different values raise `BlackboardWriteConflictError`.
+
+```python
+from jaz.hooks.effects import BlackboardWrite
+from jaz.hooks.events import LLMQueryExit
+from jaz.hooks.events.base import Completed
+
+def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
+    if isinstance(event.outcome, Completed):
+        cost = event.outcome.result.cost_usd or 0.0
+        # Publish accumulated cost for another hook to read next event.
+        prior = event.blackboard.get("total_cost", 0.0)
+        return [BlackboardWrite(key="total_cost", value=prior + cost)]
+    return []
+```
+
+---
+
+## Effect composition summary
+
+| Effect | Stage | Composition rule |
+|--------|-------|-----------------|
+| `AddInputs` | `InvokeEnter` | Union; conflict on divergent values |
+| `DropInputs` | `InvokeEnter` | Union of keys; applied before `AddInputs` |
+| `DisableRecursion` | `InvokeEnter` | Idempotent OR |
+| `AddMessages` | `LLMQueryEnter` | Accumulate; within-slot order by `sort_key` |
+| `DropMessages` | `LLMQueryEnter` | Union of indices |
+| `AddVariables` | `REPLExecEnter` | Union; conflict on divergent values |
+| `DropVariables` | `REPLExecEnter` | Union; drops before adds |
+| `InsertCode` | `REPLExecEnter` | Accumulate; same-offset order by `sort_key` |
+| `DeleteCode` | `REPLExecEnter` | Overlapping ranges union |
+| `SupplyLLMResponse` | `LLMQuerySend` | Identical coalesces; distinct raises conflict |
+| `SupplyExecResult` | `REPLExecSend` | Fold by kind precedence (Raise > Return > Continue) |
+| `SupplyInvokeResult` | `InvokeSend` | Fold by kind precedence (terminal only) |
+| `ModifyExecResult` | `REPLExecComplete` | Fold by kind precedence onto original |
+| `ModifyInvokeResult` | `InvokeComplete` | Fold by kind precedence (terminal only) |
+| `ModifyLLMResponse` | `LLMQueryComplete` | Field-wise merge; conflict on divergent fields |
+| `Abort` | All `*Enter`/`*Send`/`*Complete`, per-turn `*Exit` | Highest precedence; multiple group into `ExceptionGroup` |
+| `BlackboardWrite` | Every event | Coalesces identical; conflicts on divergent |

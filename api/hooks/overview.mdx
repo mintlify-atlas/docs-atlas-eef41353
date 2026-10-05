@@ -1,0 +1,216 @@
+---
+title: "Hook System Overview: Events, Effects, and Lifecycle"
+sidebarTitle: "Overview"
+description: "Understand JAZ's hook system: the Hook base class, two activation modes, the three spans and four-stage pipeline, handler naming, and lifecycle methods."
+---
+
+The hook system is how you observe and influence a running JAZ agent without modifying the agent loop itself. As an agent runs, the framework fires typed **events** at fixed points — once around the whole invoke, and once per turn around the LLM query and the REPL execution. A **hook** is a class whose methods receive those events and return typed **effects**, which are the only mechanism through which a hook changes anything. The framework collects all active hooks' effects after each event, composes them order-independently, and applies them; a hook that returns `[]` everywhere is a pure observer.
+
+<Note>
+The hook system is **experimental**. Its interfaces may change in a future release.
+</Note>
+
+## The Hook base class
+
+Import path: `from jaz.hooks import Hook` (or `from jaz.hooks.dispatcher import Hook`)
+
+Subclass `Hook` and override the handler methods for the events you care about. Every method has a default no-op implementation that returns `[]`, so you only implement what you need.
+
+```python
+from jaz import invoke
+from jaz.hooks import Hook
+from jaz.hooks.effects import Abort, AddMessages, Effect
+from jaz.hooks.events import LLMQueryEnter
+
+class TurnLimiter(Hook):
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]:
+        if event.iteration >= 10:
+            return [Abort(error=RuntimeError("out of turns"))]
+        if event.iteration >= 8:
+            return [AddMessages([{"role": "user", "content": "Finish soon."}])]
+        return []
+```
+
+## Two activation modes
+
+There are two ways to activate a hook, and they differ in whether nested invokes see it.
+
+<Tabs>
+  <Tab title="with — propagating">
+    Use Python's `with` statement to activate a hook for all invokes in scope, including nested sub-invokes:
+
+    ```python
+    from jaz import invoke
+    from jaz.hooks import TurnLimiter
+
+    # Active for this invoke AND every invoke it nests.
+    with TurnLimiter():
+        result = invoke(task="...")
+
+    # Activate multiple hooks at once.
+    with Hook1(), Hook2():
+        result = invoke(task="...")
+    ```
+
+    Context-manager hooks propagate via contextvars, so they reach nested invokes, functions called inside the block, async code, and thread copies.
+  </Tab>
+  <Tab title="Positional arg — local">
+    Pass a hook as the first positional argument to `jaz.invoke` to scope it to that single invoke only:
+
+    ```python
+    from jaz import invoke
+    from jaz.hooks import TurnLimiter
+
+    # Active for THIS invoke; nested invokes do NOT see it.
+    result = invoke(TurnLimiter(), task="...")
+    ```
+
+    This is useful when a budget, limit, or log should cover only the outer invoke's own turns, excluding any sub-invokes it launches.
+  </Tab>
+</Tabs>
+
+<Warning>
+A hook instance may only be active in **one** scope at a time. Re-entering the same instance (e.g. `with h: with h:`, or passing it while it is already active via `with`) raises `HookActivationError` before `setup()` runs, leaving no partial state.
+</Warning>
+
+## The three spans and four-stage pipeline
+
+Every agent run has three **spans**, each walking the same four-stage pipeline: `Enter → Send → Complete → Exit`.
+
+| Span | When it fires | Enter payload | Exit outcome type |
+|------|--------------|---------------|-------------------|
+| **Invoke** | Once per `jaz.invoke()` call | Proposed inputs, scope | `Completed[Return\|Raise] \| Aborted \| Failed` |
+| **LLMQuery** | Once per turn (always) | Message buffer, model | `Completed[LLMResponse] \| Aborted \| Failed` |
+| **REPLExec** | Once per turn (only when code parsed) | Proposed code | `Completed[ExecResult] \| Aborted \| Failed` |
+
+Each stage has a specific role:
+
+| Stage | Observes | Accepts effects |
+|-------|----------|-----------------|
+| `*Enter` | The **proposal** (inputs, messages, or code before any edits) | Edit effects + `Abort` |
+| `*Send` | The **committed input** after edits are applied | Supply effects + `Abort` |
+| `*Complete` | The **raw result** before any transform | Modify effects + `Abort` |
+| `*Exit` | The **final outcome** (`Completed \| Aborted \| Failed`) | `Abort` (per-turn spans only); `InvokeExit` is observation-only |
+
+`Abort` is valid at every `*Enter`, `*Send`, and `*Complete` event, and at `LLMQueryExit` / `REPLExecExit` on every arm. `BlackboardWrite` is valid at every event including every `*Exit`. An effect returned at a stage that does not accept it raises `InvalidEffectError` — there is no silent no-op.
+
+## Handler naming convention
+
+Every event class maps to a handler method named after it in `snake_case` with an `on_` prefix:
+
+```python
+from jaz.hooks.events import (
+    InvokeEnter, InvokeSend, InvokeComplete, InvokeExit,
+    LLMQueryEnter, LLMQuerySend, LLMQueryComplete, LLMQueryExit,
+    LLMQueryRetry,
+    REPLExecEnter, REPLExecSend, REPLExecComplete, REPLExecExit,
+)
+from jaz.hooks import Hook
+from jaz.hooks.effects import Effect
+
+class MyHook(Hook):
+    def on_invoke_enter(self, event: InvokeEnter) -> list[Effect]: ...
+    def on_invoke_send(self, event: InvokeSend) -> list[Effect]: ...
+    def on_invoke_complete(self, event: InvokeComplete) -> list[Effect]: ...
+    def on_invoke_exit(self, event: InvokeExit) -> list[Effect]: ...
+
+    def on_llm_query_enter(self, event: LLMQueryEnter) -> list[Effect]: ...
+    def on_llm_query_send(self, event: LLMQuerySend) -> list[Effect]: ...
+    def on_llm_query_complete(self, event: LLMQueryComplete) -> list[Effect]: ...
+    def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]: ...
+    def on_llm_query_retry(self, event: LLMQueryRetry) -> list[Effect]: ...
+
+    def on_repl_exec_enter(self, event: REPLExecEnter) -> list[Effect]: ...
+    def on_repl_exec_send(self, event: REPLExecSend) -> list[Effect]: ...
+    def on_repl_exec_complete(self, event: REPLExecComplete) -> list[Effect]: ...
+    def on_repl_exec_exit(self, event: REPLExecExit) -> list[Effect]: ...
+```
+
+## The `on_any` catch-all observer
+
+For cross-cutting observers — loggers, tracers, replay — that treat every event uniformly, override `on_any` instead of writing thirteen separate handlers:
+
+```python
+from jaz.hooks import Hook
+from jaz.hooks.base import Event
+from jaz.hooks.effects import Effect
+
+class MyLogger(Hook):
+    def on_any(self, event: Event) -> list[Effect]:
+        print(f"[{type(event).__name__}] depth={event.depth} iteration={getattr(event, 'iteration', '-')}")
+        return []
+```
+
+`on_any` runs **in addition to** the matched typed handler for the same event — the two compose rather than one replacing the other. A hook may implement both specific `on_<event>` methods and `on_any`.
+
+## Lifecycle: `setup()` and `teardown()`
+
+Override `setup()` to acquire resources when the hook activates (open files, start providers), and `teardown(exc)` to release them when the scope ends. Both run on both the `with` and positional-argument activation paths.
+
+```python
+from pathlib import Path
+from jaz.hooks import Hook
+
+class FileLogger(Hook):
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._file = None
+
+    def setup(self) -> None:
+        self._file = open(self.path, "w", encoding="utf-8")
+
+    def teardown(self, exc: BaseException | None = None) -> None:
+        if self._file:
+            self._file.close()
+```
+
+`setup()` may run more than once on a single instance if the hook is reactivated after its previous scope ended. If reuse is unsafe (for example, `teardown` writes a file that a second run would overwrite), call `self.forbid_reactivation()` at the start of `setup()` to raise `HookActivationError` on any attempt after the first.
+
+## Activation guard and `HookActivationError`
+
+The framework enforces that one hook instance is active in exactly one scope at a time. Every overlap shape raises `HookActivationError` at activation time — before `setup()` runs — so a rejected activation leaves no partial state:
+
+- `with h: with h:` — same instance entered twice via `with`
+- A still-live positional-arg hook re-entered via `with` in the same call stack
+- Two references to the same object passed as positional args to one `invoke`
+
+Distinct *instances* of the same class nest freely; only **identity** (same object) is rejected.
+
+## Dynamic hook lists with `ExitStack`
+
+For a list of hooks known only at runtime, use `contextlib.ExitStack`:
+
+```python
+from contextlib import ExitStack
+from jaz import invoke
+from jaz.hooks import PrintLogger, BudgetPool
+
+hook_list = [PrintLogger(), BudgetPool(cost_budget=1.0)]
+
+with ExitStack() as stack:
+    for hook in hook_list:
+        stack.enter_context(hook)
+    result = invoke(task="...")
+```
+
+`ExitStack` unwinds in reverse order and passes the in-flight exception to each hook's `__exit__` exactly as nested `with` blocks do.
+
+## Per-invoke blackboard
+
+Every event carries a `blackboard` — a generationally-versioned key-value store shared across all hooks for the same invoke. `BlackboardWrite` effects are applied after every hook has run for an event, so a producer hook's write is invisible during that event and becomes visible to the next one. This coordination mechanism is order-independent by construction.
+
+```python
+from jaz.hooks import Hook
+from jaz.hooks.effects import BlackboardWrite, Effect
+from jaz.hooks.events import LLMQueryEnter, LLMQueryExit
+from jaz.hooks.events.base import Completed
+
+class CostTracker(Hook):
+    def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:
+        if isinstance(event.outcome, Completed):
+            cost = event.outcome.result.cost_usd or 0.0
+            # Increment the blackboard cost key.
+            prior = event.blackboard.get("total_cost", 0.0)
+            return [BlackboardWrite(key="total_cost", value=prior + cost)]
+        return []
+```

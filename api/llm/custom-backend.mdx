@@ -1,0 +1,390 @@
+---
+title: "Building a Custom LLM Backend for JAZ"
+sidebarTitle: "Custom Backend"
+description: "Subclass BaseLLM, implement complete(), call finalize() for token accounting, and plug your backend into JAZ with no registry required."
+---
+
+JAZ's LLM layer is designed to be extended. If you need to talk to a vendor not covered by LiteLLM, integrate a self-hosted model server with a non-OpenAI-compatible API, or add custom pre- and post-processing around every completion call, you can do so by subclassing `BaseLLM`. The result is a first-class backend: it gets JAZ's retry system, cost accounting, model metadata lookups, and configuration integration for free — no forking, no registration in a central registry, no special framework hooks to implement.
+
+```python
+from jaz.llm import BaseLLM, CompletionResponse, Usage, Choice, Message
+```
+
+<Note>
+A custom backend does **not** need to register a name with JAZ core unless a config **file** must select it by string. Code-side construction — `jaz.configure(llm=MyLLM(...))` or `ConfigOverride(llm=MyLLM(...))` — requires no name at all. If you do need config-file selection, the name lives in your file reader's own `tag → class` mapping; JAZ core holds no central registry.
+</Note>
+
+## Minimal example
+
+The README's worked example is the canonical starting point. Read it carefully: every line teaches something about the contract.
+
+```python
+import os
+from jaz.llm import BaseLLM, CompletionResponse, Usage, Choice, Message
+
+class MyLLM(BaseLLM):
+    def __init__(self, base_url: str | None = None, **retry):
+        super().__init__(**retry)             # forwards the retry_* settings
+        self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
+
+    def complete(self, model, messages, **kwargs):
+        # ... call self.base_url; raise jaz.llm.RateLimitError / AuthenticationError / ...
+        # on API errors so retry classification works.
+        response = CompletionResponse(
+            choices=[Choice(message=Message("assistant", "..."))],
+            usage=Usage(prompt_tokens=1, completion_tokens=1),
+            model=model,
+        )
+        return self.finalize(response, model)  # token accounting + cost, for free
+
+jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
+```
+
+## Step-by-step guide
+
+<Steps>
+
+### Import the base classes
+
+```python
+import os
+from jaz.llm import BaseLLM, CompletionResponse, Usage, Choice, Message
+from jaz.llm import RateLimitError, AuthenticationError, ContextWindowExceededError
+```
+
+You need `BaseLLM` to subclass, `CompletionResponse` / `Usage` / `Choice` / `Message` to build the normalized response that `finalize()` expects, and the exception types to signal errors so JAZ's retry classifier can act on them correctly.
+
+### Declare `__init__` with your backend's settings
+
+```python
+class MyLLM(BaseLLM):
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        **retry,
+    ):
+        super().__init__(**retry)
+        self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
+        self.api_key = api_key or os.environ.get("MYBACKEND_API_KEY", "")
+```
+
+The `**retry` pattern is essential. `BaseLLM.__init__` declares `model`, `max_retries`, `retry_wait_multiplier`, `retry_wait_min`, `retry_wait_max`, and `retry_policy`. Capturing them in `**retry` and forwarding with `super().__init__(**retry)` makes all of those settings visible to `declared_init_keys()` — the MRO-walking introspector that config-file loaders use to classify which authored keys go to the constructor versus which ride each request. Without the `super()` call, retry settings passed from a config file would be silently ignored.
+
+<Tip>
+`model` is also forwarded via `**retry` to `super().__init__`. You do not need to handle it yourself; `BaseLLM.__init__` assigns it to `self.model` when it is not `None`.
+</Tip>
+
+### Implement `complete()`
+
+```python
+    def complete(self, model: str, messages: list, **kwargs) -> LLMResponse:
+        import httpx
+
+        payload = {"model": model, "messages": messages, **kwargs}
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/v1/chat/completions",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                raise RateLimitError(str(exc), llm_provider="mybackend") from exc
+            if exc.response.status_code == 401:
+                raise AuthenticationError(str(exc), llm_provider="mybackend") from exc
+            raise
+
+        data = resp.json()
+        choice_data = data["choices"][0]
+        response = CompletionResponse(
+            choices=[
+                Choice(
+                    message=Message(
+                        role=choice_data["message"]["role"],
+                        content=choice_data["message"].get("content"),
+                    ),
+                    index=0,
+                    finish_reason=choice_data.get("finish_reason"),
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=data["usage"]["prompt_tokens"],
+                completion_tokens=data["usage"]["completion_tokens"],
+            ),
+            model=data.get("model", model),
+        )
+        return self.finalize(response, model)
+```
+
+The signature `complete(self, model, messages, **kwargs) -> LLMResponse` is fixed — do not change it. JAZ reads `self.model` and passes it as the `model` argument, so the backend is always called with its own configured model ID.
+
+### Call `self.finalize()` before returning
+
+`BaseLLM.finalize(response, model)` is the single step that turns your wire-shaped `CompletionResponse` into the normalized `LLMResponse` that JAZ's agent loop, budget tracking, and hooks all depend on. It:
+
+- Extracts `content` from `response.choices[0].message.content`
+- Copies `prompt_tokens`, `completion_tokens`, and `cached_tokens` from `response.usage`
+- Prices the call using JAZ's bundled pricing table (models not in the table report `cost_usd=None`)
+- Builds the ATIF-style `extra` dict (provider-specific cache and reasoning token buckets)
+
+You never need to build `LLMResponse` by hand — always end `complete()` with `return self.finalize(response, model)`.
+
+### Raise JAZ exceptions for API errors
+
+The retry system classifies errors by type. If you raise your HTTP library's raw exceptions, JAZ cannot distinguish a transient rate-limit blip (should retry) from a bad API key (should fail immediately). Map your errors to JAZ's taxonomy before they leave `complete()`:
+
+```python
+from jaz.llm import (
+    RateLimitError,
+    AuthenticationError,
+    ContextWindowExceededError,
+    ContentPolicyViolationError,
+    NotFoundError,
+    PermissionDeniedError,
+    UnsupportedParamsError,
+    APIError,
+)
+```
+
+| JAZ exception | HTTP status | Retried? |
+|--------------|-------------|----------|
+| `RateLimitError` | 429 | ✅ Yes |
+| `APIError` | 5xx, connection | ✅ Yes |
+| `AuthenticationError` | 401 | ❌ No |
+| `PermissionDeniedError` | 403 | ❌ No |
+| `NotFoundError` | 404 | ❌ No |
+| `ContextWindowExceededError` | 400 (too long) | ❌ No |
+| `ContentPolicyViolationError` | 400 (policy) | ❌ No |
+| `UnsupportedParamsError` | 400 (bad param) | ❌ No |
+
+### Configure JAZ to use your backend
+
+```python
+import jaz
+
+jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
+```
+
+`model`, `base_url`, and `api_key` are all constructor arguments declared in `MyLLM.__init__`, so they all reach the instance. The retry settings (`max_retries`, `retry_wait_min`, etc.) forward through `**retry` to `BaseLLM.__init__` and can be overridden here too:
+
+```python
+jaz.configure(
+    llm=MyLLM(
+        model="my-model",
+        base_url="http://localhost:8000",
+        max_retries=3,
+        retry_wait_max=30.0,
+    )
+)
+```
+
+</Steps>
+
+## `BaseLLM` fields and defaults
+
+The following fields are set by `BaseLLM.__init__` and are available on every subclass instance:
+
+<ResponseField name="model" type="str">
+  The model ID this backend serves. Set from the `model=` constructor argument. `get_model()` raises `ValueError` when this is empty — there is no default model.
+</ResponseField>
+
+<ResponseField name="max_retries" type="int" default="10">
+  Extra retries after the first failed call. `max_retries=2` → up to 3 total calls; `0` = no retry. Must be a non-negative integer.
+</ResponseField>
+
+<ResponseField name="retry_wait_multiplier" type="float" default="1.0">
+  Exponential backoff multiplier. Must be positive.
+</ResponseField>
+
+<ResponseField name="retry_wait_min" type="float" default="4.0">
+  Minimum wait between retries in seconds. Must be non-negative.
+</ResponseField>
+
+<ResponseField name="retry_wait_max" type="float" default="60.0">
+  Maximum wait between retries in seconds. Must be positive.
+</ResponseField>
+
+<ResponseField name="request_defaults" type="Mapping[str, Any]">
+  Read-only mapping of per-request defaults captured from the `**request_defaults` tail of `__init__`. Cannot be mutated after construction; build a new backend to change them.
+</ResponseField>
+
+<ResponseField name="retry_policy" type="Mapping[str, int] | None">
+  Optional per-exception retry budget mapping exception class names to extra retry counts. Read-only after construction.
+</ResponseField>
+
+## `finalize()` reference
+
+```python
+BaseLLM.finalize(
+    response: CompletionResponse,
+    model: str,
+    *,
+    service_tier: str | None = None,
+) -> LLMResponse
+```
+
+Call this at the end of every `complete()` implementation. Pass the `CompletionResponse` you assembled from your API's wire response and the `model` string that was passed into `complete()`. The optional `service_tier` argument picks tier-specific pricing keys (`"flex"`, `"priority"`, `"standard"`) when the bundled pricing table publishes them.
+
+```python
+def complete(self, model, messages, **kwargs):
+    ...
+    response = CompletionResponse(
+        choices=[Choice(message=Message("assistant", content))],
+        usage=Usage(
+            prompt_tokens=data["usage"]["prompt_tokens"],
+            completion_tokens=data["usage"]["completion_tokens"],
+            cache_read_input_tokens=data["usage"].get("cached_tokens", 0),
+        ),
+        model=model,
+    )
+    return self.finalize(response, model)
+```
+
+## `declared_init_keys()` utility
+
+`declared_init_keys(cls)` walks the full MRO of `cls` and returns a `frozenset` of every named `__init__` parameter — excluding `self`, `*args`, and `**kwargs` — across all classes in the hierarchy. This is what config-file loaders call to determine which authored keys are construction arguments for `cls` versus per-request defaults.
+
+```python
+from jaz.llm import declared_init_keys, BaseLLM
+
+class MyLLM(BaseLLM):
+    def __init__(self, base_url: str | None = None, **retry):
+        super().__init__(**retry)
+        self.base_url = base_url or "http://localhost:8000"
+
+# Includes MyLLM's own 'base_url' AND BaseLLM's 'model', 'max_retries', etc.
+keys = declared_init_keys(MyLLM)
+# frozenset({'base_url', 'model', 'max_retries', 'retry_wait_multiplier',
+#            'retry_wait_min', 'retry_wait_max', 'retry_policy'})
+```
+
+You do not normally call this yourself — it is used internally by config-loading infrastructure. It is documented here because understanding it explains why the `**retry` forwarding pattern is important: without the MRO walk, parameters declared only on `BaseLLM` would be invisible to the loader when examining `MyLLM`.
+
+## Adding native async support
+
+`BaseLLM.acomplete()` defaults to running `complete()` in a thread pool via `asyncio.to_thread`. For a backend with a native async HTTP client, override `acomplete()` directly:
+
+```python
+import httpx
+
+class MyLLM(BaseLLM):
+    def __init__(self, base_url: str | None = None, **retry):
+        super().__init__(**retry)
+        self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
+
+    def complete(self, model, messages, **kwargs):
+        # sync implementation
+        ...
+
+    async def acomplete(self, model, messages, **kwargs):
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{self.base_url}/v1/chat/completions",
+                json={"model": model, "messages": messages, **kwargs},
+            )
+            resp.raise_for_status()
+        data = resp.json()
+        response = CompletionResponse(
+            choices=[Choice(message=Message("assistant", data["choices"][0]["message"]["content"]))],
+            usage=Usage(
+                prompt_tokens=data["usage"]["prompt_tokens"],
+                completion_tokens=data["usage"]["completion_tokens"],
+            ),
+            model=model,
+        )
+        return self.finalize(response, model)
+```
+
+<Accordion title="Full complete example with error mapping">
+
+```python
+import os
+import httpx
+import jaz
+from jaz.llm import (
+    BaseLLM,
+    CompletionResponse,
+    Usage,
+    Choice,
+    Message,
+    RateLimitError,
+    AuthenticationError,
+    ContextWindowExceededError,
+    ContentPolicyViolationError,
+    NotFoundError,
+    PermissionDeniedError,
+    UnsupportedParamsError,
+    APIError,
+)
+
+
+class MyLLM(BaseLLM):
+    """A custom backend posting to any OpenAI-compatible endpoint."""
+
+    def __init__(self, base_url: str | None = None, api_key: str | None = None, **retry):
+        super().__init__(**retry)
+        self.base_url = (base_url or os.environ["MYBACKEND_API_BASE"]).rstrip("/")
+        self.api_key = api_key or os.environ.get("MYBACKEND_API_KEY", "")
+
+    def _map_error(self, exc: httpx.HTTPStatusError) -> Exception:
+        status = exc.response.status_code
+        msg = str(exc)
+        provider = "mybackend"
+        if status == 401:
+            return AuthenticationError(msg, status_code=status, llm_provider=provider)
+        if status == 403:
+            return PermissionDeniedError(msg, status_code=status, llm_provider=provider)
+        if status == 404:
+            return NotFoundError(msg, status_code=status, llm_provider=provider)
+        if status == 429:
+            return RateLimitError(msg, status_code=status, llm_provider=provider)
+        if status == 400:
+            if "too long" in msg.lower() or "context" in msg.lower():
+                return ContextWindowExceededError(msg, status_code=status, llm_provider=provider)
+            return UnsupportedParamsError(msg, status_code=status, llm_provider=provider)
+        return APIError(msg, status_code=status, llm_provider=provider)
+
+    def complete(self, model: str, messages: list, **kwargs) -> "LLMResponse":
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/v1/chat/completions",
+                json={"model": model, "messages": messages, **kwargs},
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=kwargs.pop("timeout", 120.0),
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise self._map_error(exc) from exc
+        except httpx.RequestError as exc:
+            raise APIError(str(exc), llm_provider="mybackend") from exc
+
+        data = resp.json()
+        c = data["choices"][0]
+        response = CompletionResponse(
+            choices=[
+                Choice(
+                    message=Message(
+                        role=c["message"]["role"],
+                        content=c["message"].get("content"),
+                    ),
+                    index=0,
+                    finish_reason=c.get("finish_reason"),
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=data["usage"]["prompt_tokens"],
+                completion_tokens=data["usage"]["completion_tokens"],
+            ),
+            model=data.get("model", model),
+        )
+        return self.finalize(response, model)
+
+
+# Use it
+jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
+```
+
+</Accordion>

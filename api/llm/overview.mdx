@@ -1,0 +1,117 @@
+---
+title: "LLM Backends: BaseLLM, Providers, and Configuration"
+sidebarTitle: "Overview"
+description: "Understand JAZ's LLM component model: one backend per config, LiteLLM as the stable default, response types, and exception taxonomy."
+---
+
+JAZ talks to language models through a pluggable backend layer. Each configuration holds exactly one backend — an instance of a class that subclasses `BaseLLM` — and setting `llm=` in a `jaz.configure` call or a `ConfigOverride` replaces the whole backend at once. There is no partial update of individual fields; the backend you pass states itself completely through its constructor arguments.
+
+## The only stable backend: LiteLLM
+
+`LiteLLM` is the sole backend covered by JAZ's stable API and is the default when no `llm=` is configured. It delegates every completion call to the `litellm` library, which means a single backend instance can route to OpenAI, Anthropic, Google Gemini, AWS Bedrock, Google Vertex AI, and every other provider LiteLLM supports — without requiring a separate JAZ release when a new model ships.
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+
+# Global configuration — applies to every subsequent invoke() call
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"))
+```
+
+Per-invoke overrides use `ConfigOverride`, which is a context manager:
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+
+with jaz.ConfigOverride(llm=LiteLLM(model="anthropic/claude-opus-4-5")):
+    result = jaz.invoke(task="Summarize the document")
+```
+
+## Model ID format
+
+The model ID passed to `LiteLLM(model=...)` is LiteLLM's routing key and is forwarded verbatim to the API. It carries a `provider/model` prefix that LiteLLM uses to select the right endpoint and credentials:
+
+| Provider | Example model ID |
+|----------|-----------------|
+| OpenAI | `openai/gpt-5-mini` |
+| Anthropic | `anthropic/claude-opus-4-5` |
+| Google Gemini | `gemini/gemini-2.5-pro` |
+| AWS Bedrock | `bedrock/anthropic.claude-opus-4-5-v1:0` |
+| Google Vertex AI | `vertex_ai/gemini-2.5-pro` |
+
+<Note>
+JAZ neither strips nor rewrites the `provider/` prefix. The model ID you write reaches the backend's API as-is. For `LiteLLM`, write the ID exactly as LiteLLM's own documentation writes it.
+</Note>
+
+## Unstable backends: OpenAILLM and AnthropicLLM
+
+<Warning>
+`OpenAILLM` and `AnthropicLLM` ship inside the `jaz.llm` package and can be imported and constructed directly, but they are **not part of the stable v1 API**. They may change or be removed in any release without a deprecation notice. Reach OpenAI and Anthropic through LiteLLM's `openai/…` and `anthropic/…` routes instead.
+</Warning>
+
+```python
+# ✅ Stable — use this
+from jaz.llm import LiteLLM
+jaz.configure(llm=LiteLLM(model="anthropic/claude-opus-4-5"))
+
+# ⚠️ Not stable — avoid in production code
+from jaz.llm import AnthropicLLM
+jaz.configure(llm=AnthropicLLM(model="claude-opus-4-5"))  # not covered by stable API
+```
+
+## Response types
+
+When a backend completes a call, it returns an `LLMResponse` (the normalized result JAZ works with internally). The underlying wire-level types — which you assemble when building a custom backend — live in `jaz.llm`:
+
+<ResponseField name="CompletionResponse" type="dataclass">
+  Provider-agnostic representation of a completion call's raw output. Holds a list of `Choice` objects, an optional `Usage`, the model string, and a response `id`.
+</ResponseField>
+
+<ResponseField name="Usage" type="dataclass">
+  Token counts from one completion call. Fields: `prompt_tokens` (total input including cached tokens), `completion_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, and an open `extra` dict for provider-specific fields.
+</ResponseField>
+
+<ResponseField name="Choice" type="dataclass">
+  One completion choice. Holds a `Message`, an `index`, and a `finish_reason`.
+</ResponseField>
+
+<ResponseField name="Message" type="dataclass">
+  A single message in a completion response. Fields: `role: str` and `content: str | None`.
+</ResponseField>
+
+Import them all from `jaz.llm`:
+
+```python
+from jaz.llm import CompletionResponse, Usage, Choice, Message
+```
+
+## LLM exceptions
+
+All LLM errors inherit from `LLMError` (itself a `JazException`). They are defined in `jaz.exceptions` and re-exported from `jaz.llm.exceptions` for convenience. The retry system uses these types to classify which errors should be retried and which should fail immediately.
+
+| Exception | Retried? | Cause |
+|-----------|----------|-------|
+| `RateLimitError` | ✅ Yes | Provider rate limit hit |
+| `APIError` | ✅ Yes | Transient server or connection error |
+| `AuthenticationError` | ❌ No | Missing or invalid API key |
+| `ContextWindowExceededError` | ❌ No | Prompt exceeds the model's context window |
+| `ContentPolicyViolationError` | ❌ No | Prompt or response blocked by provider policy |
+| `NotFoundError` | ❌ No | Model ID not found |
+| `PermissionDeniedError` | ❌ No | Account lacks access to the requested model |
+| `UnsupportedParamsError` | ❌ No | A request parameter was rejected by the API |
+
+```python
+from jaz.llm import RateLimitError, AuthenticationError, ContextWindowExceededError
+```
+
+## Pages in this section
+
+<CardGroup cols={2}>
+  <Card title="LiteLLM" href="/api/llm/litellm" icon="layer-group">
+    Constructor parameters, provider routing, local server configuration, and per-request defaults for the default stable backend.
+  </Card>
+  <Card title="Custom Backend" href="/api/llm/custom-backend" icon="wrench">
+    Subclass `BaseLLM`, implement `complete()`, call `finalize()`, and wire your backend into JAZ without forking.
+  </Card>
+</CardGroup>

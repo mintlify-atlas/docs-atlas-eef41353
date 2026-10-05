@@ -1,0 +1,229 @@
+---
+title: "invoke() and ainvoke() — Run a JAZ Agent"
+sidebarTitle: "invoke()"
+description: "Run a REPL-based JAZ agent synchronously or asynchronously. Supports return type narrowing via ReturnType, local hooks, and a ConfigOverride in the same positional channel."
+---
+
+The two entry points into the JAZ agent loop are `invoke` and `ainvoke`. Every keyword argument you pass becomes both a variable bound in the agent's Python REPL and a named item rendered in the agent's prompt header. Positional arguments are reserved for hooks (such as `jaz.hooks.ReturnType`) and an optional `ConfigOverride`; the prompt itself is just another keyword input.
+
+## Signatures
+
+```python
+# Overload 1 — static return type narrowing
+def invoke(
+    return_type: ReturnType[T],
+    /,
+    *local_config_hooks: Hook | ConfigOverride,
+    **inputs: object,
+) -> T: ...
+
+# Overload 2 — no return type contract
+def invoke(
+    *local_config_hooks: Hook | ConfigOverride,
+    **inputs: object,
+) -> object: ...
+```
+
+`ainvoke` carries the identical signature and semantics, but is a coroutine:
+
+```python
+async def ainvoke(
+    *local_config_hooks: Hook | ConfigOverride,
+    **inputs: object,
+) -> object: ...
+```
+
+## Parameters
+
+<ParamField path="*local_config_hooks" type="Hook | ConfigOverride">
+  Zero or more positional arguments, each either a `Hook` instance or a single
+  `ConfigOverride`. These are **local** — they apply only to this one invoke and
+  do not propagate to sub-invokes spawned inside the agent. To make a hook or
+  config override propagate, activate it as a context manager around the call
+  instead (`with MyHook(): invoke(...)`).
+
+  A `ConfigOverrideByDepth` passed positionally is rejected with a `TypeError`
+  because a per-depth override only makes sense when it propagates to sub-invokes
+  at other depths.
+</ParamField>
+
+<ParamField path="**inputs" type="object">
+  Keyword arguments that become the agent's inputs. Each key-value pair is bound
+  as a variable in the REPL namespace and rendered in the agent's prompt header.
+  Typical inputs include the task prompt (`task="..."` or
+  `instructions="..."`), data (`df=pd.DataFrame(...)`), and tools
+  (`web_search=web_search`). Inputs are local to this invoke — they do not
+  propagate to nested invokes. Use `jaz.scope` to bind values that should
+  propagate automatically.
+</ParamField>
+
+## Return type narrowing with `ReturnType`
+
+Passing a `jaz.hooks.ReturnType` hook as the **first** positional argument narrows the static return type from `object` to `T`, and enforces it at runtime:
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+# Static type: int — mypy/pyright infers `total: int`
+total: int = invoke(ReturnType(int), task="Return the sum of the numbers", numbers=[1, 2, 3])
+```
+
+Without a leading `ReturnType`, the return type is `object` and no runtime check is performed — the agent may return any value:
+
+```python
+result = invoke(task="What is the capital of France?")
+# result: object (unchecked)
+```
+
+<Note>
+  Omitting `ReturnType` is **not** the same as `ReturnType(None)`. The latter
+  still enforces that the agent returns `None`; the former places no contract on
+  the return value at all.
+</Note>
+
+## Examples
+
+<Tabs>
+  <Tab title="Basic task">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import ReturnType
+
+    result = invoke(
+        ReturnType(int),
+        task="Calculate the factorial of 10",
+    )
+    ```
+  </Tab>
+  <Tab title="With data and tools">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import ReturnType
+
+    def web_search(query: str) -> list[str]:
+        """Search the web and return result snippets."""
+        ...
+
+    result = invoke(
+        ReturnType(dict),
+        task="Look up each name and summarize what you find",
+        names=["ada", "grace"],
+        web_search=web_search,
+    )
+    ```
+  </Tab>
+  <Tab title="Local ConfigOverride">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import ReturnType
+    import jaz
+    from jaz.llm import LiteLLM
+
+    # ConfigOverride is local to this one invoke; sub-invokes see the ambient config
+    result = invoke(
+        jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7)),
+        ReturnType(str),
+        task="Creative task",
+    )
+    ```
+  </Tab>
+  <Tab title="Budget + logging hooks">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import BudgetPool, FileLogger, ReturnType
+
+    with FileLogger("agent.log"), BudgetPool(cost_budget=1.0):
+        result = invoke(ReturnType(str), task="Build a web scraper")
+    ```
+  </Tab>
+</Tabs>
+
+## `ainvoke` — the async variant
+
+`ainvoke` is the async version of `invoke`. It runs the agent loop without blocking the event loop, which enables two things the sync version cannot provide:
+
+- **Concurrent execution** — run multiple agents at the same time with `asyncio.gather`.
+- **Top-level `await` in the agent REPL** — the agent can write `await some_coroutine()` directly in its generated code.
+
+Arguments are identical to `invoke`.
+
+```python
+import asyncio
+from jaz import ainvoke
+from jaz.hooks import ReturnType
+
+async def main():
+    # Run two agents concurrently
+    result_a, result_b = await asyncio.gather(
+        ainvoke(ReturnType(list), task="List the planets", max_count=4),
+        ainvoke(ReturnType(list), task="List the continents"),
+    )
+    return result_a, result_b
+
+asyncio.run(main())
+```
+
+## Error cases
+
+<Accordion title="Passing a string positionally">
+  A common mistake is passing the prompt as the first positional argument, as many other agent libraries accept. JAZ raises a `TypeError` with a corrected call:
+
+  ```python
+  invoke("Calculate the factorial of 10")
+  # TypeError: invoke() got the prompt as a positional argument (str).
+  # The prompt is an input, passed by keyword, e.g., invoke(task='Calculate the factorial of 10').
+  ```
+</Accordion>
+
+<Accordion title="Passing ReturnType twice">
+  An invoke has a single return type. Passing `ReturnType` more than once raises a `TypeError`:
+
+  ```python
+  from jaz.hooks import ReturnType
+
+  invoke(ReturnType(int), ReturnType(str), task="...")
+  # TypeError: invoke() got more than one ReturnType(...) hook; an invoke has a single
+  # return type. Pass exactly one ReturnType(...).
+  ```
+</Accordion>
+
+<Accordion title="Passing ConfigOverrideByDepth positionally">
+  A per-depth override is only meaningful when it propagates across recursion depths. Passing one positionally is rejected:
+
+  ```python
+  from jaz.config import ConfigOverrideByDepth
+
+  invoke(ConfigOverrideByDepth({2: {"repl": ...}}), task="...")
+  # TypeError: invoke() got a ConfigOverrideByDepth positional argument.
+  # Use a propagating `with jaz.ConfigOverrideByDepth(...):` block instead.
+  ```
+</Accordion>
+
+## Tools as inputs
+
+Tools are plain Python functions passed as keyword arguments. Their signature and docstring render in the agent's prompt header automatically — the docstring *is* the description the agent reads:
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+def my_tool(x: int) -> int:
+    """Double a number."""
+    return x * 2
+
+result = invoke(ReturnType(int), task="Use my_tool on 5", my_tool=my_tool)
+```
+
+To group related tools, pass an object — its public methods render as a catalog:
+
+```python
+class Utils:
+    """Utility helpers."""
+
+    def my_tool(self, x: int) -> int:
+        """Double a number."""
+        return x * 2
+
+result = invoke(ReturnType(int), task="Use utils.my_tool on 5", utils=Utils())
+```

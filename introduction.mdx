@@ -1,0 +1,65 @@
+---
+title: "JAZ: A Framework for Object-Oriented LLM Agents"
+sidebarTitle: "Introduction"
+description: "JAZ is a minimalist Python framework for LLM agents that write and run code in a REPL loop, using plain functions as tools and hooks for extensibility."
+---
+
+JAZ is a Python framework for building LLM agents that think by writing code. Instead of orchestrating chains of prompt templates or rigid tool-call schemas, JAZ gives an LLM a live Python REPL: the model writes code, sees what it evaluates to, and keeps iterating until it calls `return` with its answer. The result is a workflow that is simultaneously readable Python and fully agentic reasoning.
+
+## The Core Mental Model
+
+Every `jaz.invoke` call starts a conversation between an LLM and a Python REPL. The loop is straightforward:
+
+1. **LLM writes code** — the model receives the task, any data you passed in, and the signatures of any tools available to it, then produces a code block.
+2. **REPL executes** — the code runs in an isolated Python interpreter; its output, return value, or any exception is captured.
+3. **Observation feeds back** — the execution result becomes the next message to the model, which refines its approach.
+4. **Agent returns** — when the model is satisfied, it calls native Python `return value`. That value is validated against a declared `ReturnType` and handed back to your code.
+
+This loop means agents can use the full Python standard library, call any function you inject, and produce structured outputs that are ordinary Python objects — no JSON parsing, no schema coercion.
+
+## Key Differentiators
+
+**Tools are plain functions.** There is no registry, no decorator, no schema to write. Pass a function as a keyword argument to `invoke` and its signature plus docstring become the tool description the agent reads. Tools sit alongside data in the same call — `invoke(task="...", data=df, web_search=my_fn)`.
+
+**Hook system for extensibility.** Logging, budget enforcement, iteration limits, tracing, trajectory recording, and custom workflow strategies all compose through a single `Hook` base class and a typed event/effect vocabulary. Hooks are context managers, so they stack naturally and propagate into nested invokes automatically.
+
+**LiteLLM routes to every provider.** The default backend is `jaz.llm.LiteLLM`, which forwards to OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure, and every other provider LiteLLM supports — one backend, one model-ID convention (`openai/gpt-4o`, `anthropic/claude-opus-4`, …). Swap backends by subclassing `jaz.llm.BaseLLM`.
+
+**Recursive agent composition.** An agent can call `jaz.invoke` inside its own REPL to delegate sub-tasks to nested agents. Budgets, hook contexts, and recursion depth all propagate cleanly through the call tree.
+
+<Note>
+JAZ requires **Python ≥ 3.12**. Python 3.14 or later unlocks the full feature set — including t-string prompt syntax (`task=t"Analyze the {data}"`) and the interactive `jaz` console. All other features work on 3.12 and 3.13 with the equivalent keyword form (`task="Analyze the data", data=data`).
+</Note>
+
+## Architecture at a Glance
+
+The framework is organized into a small set of cooperating layers. Each layer exposes a base class you can replace and a default concrete implementation that works out of the box:
+
+```text
+jaz/
+├── invoke.py       # Public invoke() / ainvoke() API
+├── config.py       # configure(), ConfigOverride, get_config()
+├── hooks/          # Hook base class + built-in hooks, events, effects
+├── llm/            # BaseLLM + LiteLLM (default)
+├── repl/           # BaseREPL + PythonREPL (default)
+└── protocol/       # BaseProtocol + CodeOnlyProtocol (default)
+```
+
+You interact primarily with `jaz.invoke` and the hooks. The LLM, REPL, and protocol layers are pluggable via `jaz.configure()` or a local `jaz.ConfigOverride`, but the defaults handle the common case with no configuration required.
+
+## Explore the Docs
+
+<CardGroup cols={2}>
+  <Card title="Agent Loop" icon="arrows-rotate" href="/concepts/agent-loop">
+    How the LLM-REPL conversation works, what events fire at each stage, and how the agent decides when to stop.
+  </Card>
+  <Card title="Tools & Inputs" icon="wrench" href="/concepts/tools-and-inputs">
+    Passing functions, objects, and data to an agent. Scoped inputs that propagate to nested invokes.
+  </Card>
+  <Card title="Hooks" icon="webhook" href="/concepts/hooks">
+    The event and effect system for logging, budget control, validation, tracing, and custom workflow strategies.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/concepts/configuration">
+    Global defaults with `jaz.configure`, per-call overrides with `ConfigOverride`, and the LiteLLM backend.
+  </Card>
+</CardGroup>

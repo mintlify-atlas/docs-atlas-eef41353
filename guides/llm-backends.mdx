@@ -1,0 +1,208 @@
+---
+title: "Configure LLM Backends, Local Servers, and Custom Providers"
+sidebarTitle: "LLM Backends"
+description: "Use LiteLLM to route to any provider, point at a local OpenAI-compatible server, use GitHub Copilot, or build your own backend with BaseLLM."
+---
+
+JAZ talks to language models through a `BaseLLM` layer. **LiteLLM is the only backend covered by the stable API and the default** — it routes a single interface to every provider LiteLLM supports (OpenAI, Anthropic, Gemini, Bedrock, Vertex, and more). Other backends ship in the package but can change or be removed; you can also write your own without forking JAZ.
+
+## LiteLLM — the default backend
+
+`LiteLLM` accepts any model ID that LiteLLM's router understands. The model string is sent **verbatim** to LiteLLM; JAZ does not strip or rewrite a `provider/` prefix.
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+
+# Set the model globally for the whole session
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"))
+```
+
+### Model ID format
+
+Use LiteLLM's `provider/model-id` routing format:
+
+```
+openai/gpt-5-mini
+openai/gpt-5
+anthropic/claude-opus-4-5
+anthropic/claude-sonnet-5
+vertex_ai/gemini-2.5-pro
+bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0
+```
+
+### Per-request defaults
+
+Pass any LiteLLM-recognized parameter as a keyword argument and it will be forwarded to every request:
+
+```python
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/gpt-5-mini",
+        temperature=0.7,
+        max_tokens=2000,
+        reasoning_effort="high",
+    )
+)
+```
+
+### Retry policy
+
+The base `BaseLLM` wraps every completion call with configurable retry logic:
+
+<ParamField path="max_retries" type="int" default="3">
+  Maximum number of retry attempts on transient failures (rate limits, server errors).
+</ParamField>
+<ParamField path="retry_wait_multiplier" type="float" default="1">
+  Exponential backoff multiplier between retry attempts.
+</ParamField>
+<ParamField path="retry_wait_min" type="float" default="4">
+  Minimum wait time in seconds between retries.
+</ParamField>
+<ParamField path="retry_wait_max" type="float" default="10">
+  Maximum wait time in seconds between retries.
+</ParamField>
+
+```python
+jaz.configure(
+    llm=LiteLLM(
+        model="anthropic/claude-opus-4-5",
+        max_retries=5,
+        retry_wait_min=2,
+        retry_wait_max=30,
+    )
+)
+```
+
+### Per-invoke override
+
+Use `jaz.ConfigOverride` to override the LLM for a single invoke or a scoped block:
+
+```python
+with jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7)):
+    result = invoke(ReturnType(str), task="Creative task")
+```
+
+---
+
+## Local OpenAI-compatible servers
+
+Ollama, vLLM, LM Studio, and llama.cpp all expose an OpenAI-compatible HTTP API. Point LiteLLM at them with `api_base`. The `openai/` route prefix requires an `api_key` even for local servers; any non-empty string works:
+
+```python
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/llama3",
+        api_base="http://localhost:11434/v1",
+        api_key="dummy",  # required by the openai/ route; value is ignored by local servers
+    )
+)
+```
+
+<CodeGroup>
+
+```python Ollama
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/llama3.1:8b",
+        api_base="http://localhost:11434/v1",
+        api_key="dummy",
+    )
+)
+```
+
+```python vLLM
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/mistral-7b-instruct",
+        api_base="http://localhost:8000/v1",
+        api_key="dummy",
+    )
+)
+```
+
+```python LM Studio
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/local-model",
+        api_base="http://localhost:1234/v1",
+        api_key="lm-studio",
+    )
+)
+```
+
+</CodeGroup>
+
+---
+
+## GitHub Copilot backend
+
+The `copilot` extra installs `CopilotLLM`, which authenticates via a Copilot subscription and bills GitHub AI credits instead of a provider API key. Model IDs are Copilot's own, without a `provider/` prefix.
+
+```bash
+pip install "jaz-lang[copilot]"
+```
+
+```python
+import jaz
+from jaz.llm import CopilotLLM
+
+jaz.configure(llm=CopilotLLM(model="gpt-5-mini"))
+```
+
+Authentication checks `github_token` first, then `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN` in the environment, then your signed-in `gh`/`copilot` CLI.
+
+<Warning>
+`CopilotLLM` is not part of the stable API. Its interface may change or be removed in a future release. Reach OpenAI and Anthropic models through LiteLLM's `openai/…` and `anthropic/…` routes for the most stability.
+</Warning>
+
+---
+
+## Custom backend — subclass BaseLLM
+
+You can add your own backend by subclassing `BaseLLM` and implementing `complete`. The base class handles retry, and `self.finalize(response, model)` converts a `CompletionResponse` into a normalized `LLMResponse` with cost accounting.
+
+```python
+import os
+from jaz.llm import BaseLLM, CompletionResponse, Usage, Choice, Message
+
+class MyLLM(BaseLLM):
+    def __init__(self, base_url: str | None = None, **retry):
+        super().__init__(**retry)        # forwards the retry_* settings
+        self.base_url = base_url or os.environ["MYBACKEND_API_BASE"]
+
+    def complete(self, model, messages, **kwargs):
+        # ... call self.base_url; raise jaz.llm.RateLimitError / AuthenticationError / ...
+        # on API errors so retry classification works.
+        response = CompletionResponse(
+            choices=[Choice(message=Message("assistant", "..."))],
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            model=model,
+        )
+        return self.finalize(response, model)  # token accounting + cost, for free
+
+jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
+```
+
+`finalize()` looks up the model in the bundled pricing table. Models not in the table report `cost_usd=None`. Raise `jaz.llm.RateLimitError`, `AuthenticationError`, `ContextWindowExceededError`, or other errors from `jaz.llm.exceptions` so JAZ's retry and error-classification logic works correctly.
+
+### Async completions
+
+If your backend has a native async HTTP client, implement `acomplete` as well. Without it, JAZ falls back to running `complete` in a thread pool, which works but ties up a blocking thread per in-flight call:
+
+```python
+async def acomplete(self, model, messages, **kwargs):
+    # native async implementation
+    ...
+    return self.finalize(response, model)
+```
+
+---
+
+## OpenAILLM and AnthropicLLM
+
+`OpenAILLM` and `AnthropicLLM` ship in the package but **are not part of the stable API** and are not registered in the console's tag map. Prefer the LiteLLM routes `openai/…` and `anthropic/…` to reach those providers with full stability guarantees.
+
+<Warning>
+`backend: openai` and `backend: anthropic` are not valid tag names in JAZ config files — those tags are not registered. Use `LiteLLM(model="openai/gpt-5-mini")` or `LiteLLM(model="anthropic/claude-opus-4-5")` instead.
+</Warning>

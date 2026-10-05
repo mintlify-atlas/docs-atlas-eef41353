@@ -1,0 +1,215 @@
+---
+title: "Configuring JAZ: LLM, REPL, and Protocol Settings"
+sidebarTitle: "Configuration"
+description: "Set the LLM backend, REPL executor, and protocol codec globally or per-invoke using jaz.configure, ConfigOverride, and ConfigOverrideByDepth."
+---
+
+JAZ configuration is organized into three component groups — `llm`, `repl`, and `protocol` — each holding a fully self-contained component object. You set a group by constructing the component and passing it; the component's constructor is the full schema for that group's settings. This model means there are no partial updates: setting a group replaces it entirely with the new component you provide.
+
+## The Three Configuration Groups
+
+<CardGroup cols={3}>
+  <Card title="llm" icon="robot">
+    Controls the LLM backend. Default: `LiteLLM()`. Subclass `BaseLLM` to add a custom backend.
+  </Card>
+  <Card title="repl" icon="terminal">
+    Controls the Python REPL execution layer. Default: `PythonREPL()`. Subclass `BaseREPL` for custom execution.
+  </Card>
+  <Card title="protocol" icon="code">
+    Controls the LLM↔REPL codec: how prompts are built and responses parsed. Default: `CodeOnlyProtocol()`. Subclass `BaseProtocol` for custom formats.
+  </Card>
+</CardGroup>
+
+## Global Configuration with `jaz.configure`
+
+`jaz.configure()` sets the process-wide defaults. It takes keyword arguments matching the three group names; any group you omit is left unchanged.
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+from jaz.repl.python_repl import PythonREPL
+
+# Set the model globally — applies to every invoke() in this process
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7))
+
+# You can set multiple groups at once, or call configure() multiple times
+jaz.configure(
+    llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7, max_tokens=2000),
+    repl=PythonREPL(exec_timeout=60),
+)
+```
+
+<Warning>
+**Setting a group replaces it entirely.** There is no partial update of a component's settings. If you want to change just one parameter, you must restate the full component. For example, `jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"))` resets the LLM to the default `LiteLLM` configuration except for the model.
+</Warning>
+
+## Reading the Current Config
+
+`jaz.get_config()` returns the current effective `Config` object, folding any active `ConfigOverride` layers onto the global default:
+
+```python
+config = jaz.get_config()
+print(config.llm)       # The current BaseLLM instance
+print(config.repl)      # The current BaseREPL instance
+print(config.protocol)  # The current BaseProtocol instance
+```
+
+Use this for introspection and testing. Inside a hook handler, prefer `event.config` — it gives the depth-resolved config for the specific invoke that fired the event, which may differ from the ambient `get_config()` if a `ConfigOverrideByDepth` is in use.
+
+## Dynamically Scoped Overrides with `ConfigOverride`
+
+`ConfigOverride` lets you apply temporary overrides for the duration of a `with` block. Like hooks, it has two modes:
+
+<Tabs>
+  <Tab title="Context manager (propagates to nested invokes)">
+    ```python
+    import jaz
+    from jaz.llm import LiteLLM
+    from jaz import invoke
+    from jaz.hooks import ReturnType
+
+    with jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7)):
+        result = invoke(ReturnType(str), task="Creative task")
+        # All nested invoke() calls in this block also use gpt-5-mini at temperature 0.7
+    ```
+
+    The `with` form pushes a diff onto a per-context override stack. Every `invoke()` call inside the block — including recursive ones spawned by the agent — inherits these overrides. The stack is ordered last-wins: an inner `with ConfigOverride(...)` takes precedence over an outer one for the same group.
+  </Tab>
+  <Tab title="Positional argument (local to one invoke)">
+    ```python
+    from jaz import invoke
+    from jaz.hooks import ReturnType
+
+    result = invoke(
+        jaz.ConfigOverride(llm=LiteLLM(model="anthropic/claude-opus-4-5")),
+        ReturnType(str),
+        task="This invoke uses a different model",
+    )
+    # Nested invokes the agent spawns use the ambient config, not this override
+    ```
+
+    Passing `ConfigOverride` as a positional argument to `invoke()` scopes it to that single call. The agent's own recursive `jaz.invoke()` calls see the ambient config stack, not this local layer.
+  </Tab>
+</Tabs>
+
+<Note>
+A `configure()` call made **inside** a `with ConfigOverride(...)` block updates the global baseline beneath the active override layer, but the override remains in effect for the whole extent of its block. The new baseline value only becomes visible once the `with` block exits and the override lifts. This is the same layering semantics as `jaz.describe` and `jaz.scope`.
+</Note>
+
+## Per-Depth Overrides with `ConfigOverrideByDepth`
+
+`ConfigOverrideByDepth` lets you apply different configurations at different recursion depths. It maps absolute depth integers (top invoke = depth 1) to partial configs. This is useful for routing high-level orchestrator invokes to a powerful model while sub-agents use a faster, cheaper one:
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+from jaz import invoke
+from jaz.hooks import ReturnType
+
+with jaz.ConfigOverrideByDepth({
+    1: {"llm": LiteLLM(model="openai/gpt-5")},       # top-level invoke
+    2: {"llm": LiteLLM(model="openai/gpt-5-mini")},  # its sub-invokes
+}):
+    result = invoke(ReturnType(list), task="Complex multi-level task")
+```
+
+<Warning>
+`ConfigOverrideByDepth` **must** be used as a context manager (`with` form only). Passing it positionally to `invoke()` raises `TypeError`. Per-depth config is only meaningful when it propagates to sub-invokes at other depths; at a single invoke level it would only ever apply to that invoke's own depth, which collapses it to a degenerate plain override.
+</Warning>
+
+Precedence when multiple override types are active follows declaration order — an inner `with ConfigOverride(...)` entered after a `ConfigOverrideByDepth` takes precedence at any depth where both apply.
+
+## LiteLLM Constructor Reference
+
+`LiteLLM` is the default and only stable backend. Its constructor takes the model identifier, provider connection settings, retry policy, and per-request defaults:
+
+<Accordion title="LiteLLM constructor parameters">
+<ParamField path="model" type="str" required>
+  The LiteLLM route string, e.g. `"openai/gpt-5-mini"`, `"anthropic/claude-opus-4-5"`, `"openai/llama3"`. JAZ passes this verbatim to LiteLLM; the `provider/` prefix selects the backend.
+</ParamField>
+
+<ParamField path="temperature" type="float">
+  Sampling temperature. Passed as a per-request default.
+</ParamField>
+
+<ParamField path="max_tokens" type="int">
+  Maximum completion tokens. Passed as a per-request default.
+</ParamField>
+
+<ParamField path="api_base" type="str">
+  Override the API base URL. Required for local OpenAI-compatible servers (Ollama, vLLM, etc.).
+</ParamField>
+
+<ParamField path="api_key" type="str">
+  Override the API key. The `openai/` route requires a non-empty string even for local servers; a dummy value (`"dummy"`) is acceptable.
+</ParamField>
+
+<ParamField path="max_retries" type="int">
+  Number of retries on retryable errors (rate limits, transient failures).
+</ParamField>
+</Accordion>
+
+### Example: Local OpenAI-Compatible Server
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+
+jaz.configure(
+    llm=LiteLLM(
+        model="openai/llama3",
+        api_base="http://localhost:11434/v1",
+        api_key="dummy",  # required by the openai/ route even for local servers
+    ),
+)
+```
+
+## PythonREPL Constructor Reference
+
+<Accordion title="PythonREPL constructor parameters">
+<ParamField path="exec_timeout" type="float">
+  Maximum wall-clock seconds for a single REPL execution. No limit by default.
+</ParamField>
+
+<ParamField path="exec_memory_limit" type="int">
+  Process RSS ceiling in bytes. Enforced independently of `exec_timeout`.
+</ParamField>
+
+<ParamField path="allowed_imports" type="list[str]">
+  Allowlist of importable module names. Defaults to `[]` (all imports denied). Use `["*"]` to allow all.
+</ParamField>
+
+<ParamField path="allowed_read_paths" type="list[str]">
+  Filesystem paths the agent may read. Defaults to `[]` (no file reads). Use `["//**"]` for the whole filesystem.
+</ParamField>
+
+<ParamField path="allowed_write_paths" type="list[str]">
+  Filesystem paths the agent may write. Defaults to `[]` (no file writes).
+</ParamField>
+</Accordion>
+
+## CodeOnlyProtocol Constructor Reference
+
+<Accordion title="CodeOnlyProtocol constructor parameters">
+<ParamField path="max_invoke_input_length" type="int">
+  Maximum characters for rendering each input's description in the prompt header. Longer descriptions are truncated.
+</ParamField>
+
+<ParamField path="max_repl_output_length" type="int">
+  Maximum characters of REPL output shown to the model per turn. Longer output is truncated.
+</ParamField>
+
+<ParamField path="truncation_prefix_ratio" type="float">
+  Fraction of the output length cap to preserve from the start (the rest comes from the end). Default `0.1`.
+</ParamField>
+</Accordion>
+
+## Configuration Precedence Summary
+
+From highest to lowest precedence:
+
+1. Local `ConfigOverride(...)` passed positionally to `invoke()` — applies to that one invoke only.
+2. Innermost active `with ConfigOverride(...)` block — applies to the block's extent and propagates.
+3. Outer `with ConfigOverride(...)` blocks — outer layers are shadowed by inner ones.
+4. `ConfigOverrideByDepth` — depth-conditional layers, folded under plain override layers.
+5. Global `jaz.configure(...)` baseline — process-wide default, always the lowest-precedence source.

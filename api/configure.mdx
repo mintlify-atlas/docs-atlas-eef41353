@@ -1,0 +1,203 @@
+---
+title: "jaz.configure() and ConfigOverride — Global and Scoped Config"
+sidebarTitle: "configure()"
+description: "Set process-wide JAZ defaults with configure(), scope them per-invoke with ConfigOverride, apply per-depth overrides with ConfigOverrideByDepth, and read the active config with get_config()."
+---
+
+JAZ configuration is grouped into three **component groups**: `llm`, `repl`, and `protocol`. Each group holds a fully-constructed component object — a `BaseLLM`, a `BaseREPL`, or a `BaseProtocol` — and setting a group replaces it entirely. There is no partial update of a single setting within a group; you restate the component with the constructor arguments you want.
+
+## `jaz.configure()`
+
+`jaz.configure()` writes the **process-wide global default**. It is a last-write-wins mutation — any call overwrites the previously configured value for the fields it names, and leaves unmentioned fields untouched.
+
+```python
+def configure(
+    *,
+    llm: BaseLLM = ...,
+    repl: BaseREPL = ...,
+    protocol: BaseProtocol = ...,
+) -> None: ...
+```
+
+### Parameters
+
+<ParamField path="llm" type="BaseLLM">
+  How JAZ talks to the model. The default is `LiteLLM()`, which routes to any
+  provider LiteLLM supports (`openai/gpt-5-mini`, `anthropic/claude-opus-4`,
+  etc.). Its constructor accepts `model`, `base_url`, `api_key`, retry settings
+  (`max_retries`, `retry_wait_multiplier`, `retry_wait_min`, `retry_wait_max`,
+  `retry_policy`), and any per-request defaults (`temperature`, `max_tokens`,
+  `reasoning_effort`).
+
+  To use a local OpenAI-compatible server, pass `base_url` and a dummy `api_key`.
+  To use a custom backend, subclass `jaz.llm.BaseLLM`.
+</ParamField>
+
+<ParamField path="repl" type="BaseREPL">
+  The REPL execution layer. The default is `PythonREPL()`. Its constructor accepts
+  `exec_timeout` (seconds), `exec_memory_limit` (process-RSS ceiling in bytes),
+  and sandbox allow-lists (`allowed_imports`, `allowed_read_paths`,
+  `allowed_write_paths`, `allowed_attributes`). All sandbox allow-lists default to
+  deny-all for security; pass `["*"]` to allow everything.
+</ParamField>
+
+<ParamField path="protocol" type="BaseProtocol">
+  The LLM↔REPL codec — how prompts are assembled and responses parsed. The default
+  is `CodeOnlyProtocol()`. Its constructor accepts template-path settings
+  (`*_template`), `max_invoke_input_length`, `max_repl_output_length`, and
+  `truncation_prefix_ratio`.
+</ParamField>
+
+### Examples
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+from jaz.repl import PythonREPL
+
+# Set the model globally
+jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7))
+
+# Extend the execution timeout
+jaz.configure(repl=PythonREPL(exec_timeout=60))
+
+# Both in one call
+jaz.configure(
+    llm=LiteLLM(model="openai/gpt-5-mini"),
+    repl=PythonREPL(exec_timeout=60),
+)
+```
+
+<Warning>
+  Setting a group **replaces it entirely**. Calling `jaz.configure(repl=PythonREPL(exec_timeout=60))` replaces the whole REPL component with a fresh `PythonREPL`. Any other settings that were previously configured on the old REPL instance (such as custom sandbox allow-lists) are lost unless restated.
+</Warning>
+
+---
+
+## `ConfigOverride`
+
+`ConfigOverride` applies a temporary config override in one of two modes, mirroring the two ways a hook can be activated.
+
+```python
+class ConfigOverride:
+    def __init__(
+        self,
+        *,
+        llm: BaseLLM = ...,
+        repl: BaseREPL = ...,
+        protocol: BaseProtocol = ...,
+    ) -> None: ...
+```
+
+### Mode 1: Context manager (propagating)
+
+Used as a `with` block, `ConfigOverride` is **dynamically scoped**: the override applies for the duration of the block and **propagates** to every nested `jaz.invoke()` inside it.
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+from jaz.protocol import CodeOnlyProtocol
+
+with jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini", temperature=0.7)):
+    # Every invoke in this block, and all recursive sub-invokes, use gpt-5-mini
+    result = invoke(task="Creative task")
+```
+
+### Mode 2: Positional argument (local)
+
+Passed positionally to `jaz.invoke()`, `ConfigOverride` is **local**: it applies only to that single invoke and is **not** inherited by any sub-invoke the agent spawns.
+
+```python
+from jaz import invoke
+from jaz.hooks import ReturnType
+import jaz
+from jaz.llm import LiteLLM
+
+result = invoke(
+    jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini")),
+    ReturnType(str),
+    task="Creative task",
+)
+# Any jaz.invoke(...) call the agent makes uses the ambient config, not this override
+```
+
+<Note>
+  At most **one** `ConfigOverride` may be passed positionally to a single `invoke`. Passing two raises `TypeError`. Compose multiple field changes into one `ConfigOverride(...)` call, or move shared overrides into a propagating `with ConfigOverride(...):` block.
+</Note>
+
+### Single-activation rule
+
+A single `ConfigOverride` instance may be active in **at most one `with` scope at a time**. Re-entering the same instance — nested or from another thread — raises `ConfigOverrideActivationError`. Construct a fresh instance per scope; sequential reuse after the block exits is fine.
+
+---
+
+## `ConfigOverrideByDepth`
+
+`ConfigOverrideByDepth` applies per-recursion-depth config overrides. It accepts a mapping of absolute recursion depth (the top invoke is depth 1) to a partial config.
+
+```python
+from jaz.config import ConfigOverrideByDepth
+from jaz.llm import LiteLLM
+from jaz.repl import PythonREPL
+
+with ConfigOverrideByDepth({
+    1: {"llm": LiteLLM(model="openai/gpt-5")},        # top invoke
+    2: {"llm": LiteLLM(model="openai/gpt-5-mini"),    # its direct sub-invokes
+        "repl": PythonREPL(exec_timeout=10)},
+}):
+    result = invoke(task="Complex recursive task")
+```
+
+<Warning>
+  `ConfigOverrideByDepth` is **context-manager-only**. Passing it positionally to `jaz.invoke()` raises `TypeError`. A per-depth override is only meaningful when it propagates across recursion depths; locally it would apply only at the single depth of the invoke it is passed to, which collapses it to a degenerate plain override.
+</Warning>
+
+---
+
+## `get_config()`
+
+`get_config()` returns the current **effective** configuration — the global default folded with any active propagating `ConfigOverride` layers in the current context.
+
+```python
+def get_config() -> Config: ...
+```
+
+The returned `Config` has three fields matching the three groups: `config.llm`, `config.repl`, and `config.protocol`.
+
+```python
+import jaz
+
+config = jaz.get_config()
+print(config.llm)       # e.g. LiteLLM(model='openai/gpt-5-mini')
+print(config.repl)      # e.g. PythonREPL(exec_timeout=30)
+print(config.protocol)  # e.g. CodeOnlyProtocol(...)
+```
+
+<Note>
+  `get_config()` returns the **depth-less** effective config. It applies propagating `ConfigOverride` layers but does not apply any per-depth `ConfigOverrideByDepth` partial. The depth-resolved config for a specific invoke is visible as `event.config` inside a hook handler.
+</Note>
+
+---
+
+## Layering semantics
+
+JAZ uses a **base-plus-shadow-stack** model to compose `configure()` and `ConfigOverride`:
+
+- `jaz.configure()` writes the **permanent base** — a process-wide singleton, last-write-wins.
+- Each active `with ConfigOverride(...)` pushes a **scoped shadow layer** on top. Layers are ordered; the innermost (latest) wins.
+- Reads fold base-then-layers, so a `configure(x=...)` made *inside* a `with ConfigOverride(x=...)` block updates the base beneath the shadow. The override continues to take effect for the whole duration of the block; the new base value surfaces only after the scope exits.
+
+```python
+import jaz
+from jaz.llm import LiteLLM
+
+jaz.configure(llm=LiteLLM(model="openai/gpt-5"))
+
+with jaz.ConfigOverride(llm=LiteLLM(model="openai/gpt-5-mini")):
+    # Effective: gpt-5-mini (the override shadows the base)
+    jaz.configure(llm=LiteLLM(model="openai/gpt-5-nano"))
+    # Still effective inside the block: gpt-5-mini (configure updated the BASE,
+    # but the shadow layer still wins for the block's entire extent)
+
+# After the block: gpt-5-nano (shadow lifted; the base update is now visible)
+```
