@@ -170,7 +170,7 @@ with RecursionLimit(max_depth=3):
 
 ## Budget
 
-<Accordion title="BudgetPool(cost_budget, calls_budget)">
+<Accordion title="BudgetPool">
 
 **Purpose:** Enforce a shared LLM cost and/or call-count budget over everything in scope. Every invoke that the hook is active for draws on the same pool. Reaching the budget is a hard stop (raises `BudgetPoolExhaustedError`); an optional approaching-budget warning can nudge the agent to finish.
 
@@ -325,6 +325,10 @@ with FileLogger("run.log"):
   Destination file. When `None`, the trajectory is held in memory and readable via `get_trajectories()` after the scope ends.
 </ParamField>
 
+<ParamField path="indent" type="int | None" default="2">
+  JSON indentation for the written file. `None` writes compact single-line JSON.
+</ParamField>
+
 **Events handled:** `InvokeEnter`, `InvokeSend`, `InvokeExit`, `LLMQueryEnter`, `LLMQuerySend`, `LLMQueryExit`, `LLMQueryRetry`.
 
 **Usage:**
@@ -393,11 +397,11 @@ with TrajectoryReplay("trace.atif.json"):
 from jaz import invoke
 from jaz.hooks import RolloutRecorder
 
-recorder = RolloutRecorder()
-with recorder:
+rec = RolloutRecorder()
+with rec:
     result = invoke(task="...")
 
-rollouts = recorder.get_rollouts()
+rollouts = rec.rollouts  # list[Rollout], one per recorded invoke
 ```
 
 </Accordion>
@@ -428,7 +432,7 @@ pip install "jaz-lang[tracing]"
   Langfuse base URL. Falls back to `LANGFUSE_HOST` / `LANGFUSE_BASE_URL` env vars, or `https://cloud.langfuse.com`.
 </ParamField>
 
-<ParamField path="service_name" type="str" default='"jaz-agent"'>
+<ParamField path="service_name" type="str" default="jaz-agent">
   OpenTelemetry service name attribute.
 </ParamField>
 
@@ -478,7 +482,7 @@ with JaegerTracing(endpoint="http://localhost:4318/v1/traces"):
   OTLP HTTP endpoint URL (e.g. `http://collector:4318/v1/traces`).
 </ParamField>
 
-<ParamField path="service_name" type="str" default='"jaz-agent"'>
+<ParamField path="service_name" type="str" default="jaz-agent">
   OpenTelemetry service name attribute.
 </ParamField>
 

@@ -1,5 +1,5 @@
 ---
-title: "JAZ Exception Hierarchy"
+title: "JAZ Exceptions: Errors, Warnings, and Catch Patterns"
 sidebarTitle: "Exceptions"
 description: "Every JAZ exception and warning: sandbox violations, budget limits, hook errors, LLM provider failures, and description warnings — with catch patterns."
 ---
@@ -65,7 +65,7 @@ def my_tool(query: str) -> str:
 
 | Caller | Can catch? |
 |--------|-----------|
-| Agent REPL code | **No** — `FatalError` is injected as un-catchable by the AST transform |
+| Agent REPL code | **No** — `FatalError` is exempt from being caught by agent-written `except` and `except*` clauses |
 | Your tool code / host code | **Yes** — by catching it explicitly |
 | A hook | **No** — propagates during unwind; no transform boundary fires |
 

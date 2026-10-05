@@ -67,7 +67,7 @@ JAZ reads provider credentials from the environment using each provider's standa
     import jaz
     from jaz.llm import CopilotLLM
 
-    jaz.configure(llm=CopilotLLM(model="gpt-4o"))
+    jaz.configure(llm=CopilotLLM(model="gpt-5-mini"))
     ```
 
     Authentication checks `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN` in that order, then falls back to your `gh`/`copilot` CLI login.

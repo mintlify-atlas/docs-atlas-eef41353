@@ -80,7 +80,7 @@ with JaegerTracing(
 `OTelTracing` is the base class that `LangfuseTracing` and `JaegerTracing` both extend. Subclass it to export to any OTLP-compatible collector — Grafana Tempo, Honeycomb, Datadog, or your own:
 
 ```python
-from jaz.hooks.builtin import OTelTracing
+from jaz.hooks import OTelTracing
 
 class MyCollectorTracing(OTelTracing):
     def __init__(self):

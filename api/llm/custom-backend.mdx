@@ -48,11 +48,11 @@ jaz.configure(llm=MyLLM(model="my-model", base_url="http://localhost:8000"))
 
 ```python
 import os
-from jaz.llm import BaseLLM, CompletionResponse, Usage, Choice, Message
+from jaz.llm import BaseLLM, LLMResponse, CompletionResponse, Usage, Choice, Message
 from jaz.llm import RateLimitError, AuthenticationError, ContextWindowExceededError
 ```
 
-You need `BaseLLM` to subclass, `CompletionResponse` / `Usage` / `Choice` / `Message` to build the normalized response that `finalize()` expects, and the exception types to signal errors so JAZ's retry classifier can act on them correctly.
+You need `BaseLLM` to subclass, `LLMResponse` as the return type of `complete()`, `CompletionResponse` / `Usage` / `Choice` / `Message` to build the normalized response that `finalize()` expects, and the exception types to signal errors so JAZ's retry classifier can act on them correctly.
 
 ### Declare `__init__` with your backend's settings
 
@@ -268,6 +268,7 @@ You do not normally call this yourself — it is used internally by config-loadi
 `BaseLLM.acomplete()` defaults to running `complete()` in a thread pool via `asyncio.to_thread`. For a backend with a native async HTTP client, override `acomplete()` directly:
 
 ```python
+import os
 import httpx
 
 class MyLLM(BaseLLM):
@@ -306,6 +307,7 @@ import httpx
 import jaz
 from jaz.llm import (
     BaseLLM,
+    LLMResponse,
     CompletionResponse,
     Usage,
     Choice,
@@ -347,7 +349,7 @@ class MyLLM(BaseLLM):
             return UnsupportedParamsError(msg, status_code=status, llm_provider=provider)
         return APIError(msg, status_code=status, llm_provider=provider)
 
-    def complete(self, model: str, messages: list, **kwargs) -> "LLMResponse":
+    def complete(self, model: str, messages: list, **kwargs) -> LLMResponse:
         try:
             resp = httpx.post(
                 f"{self.base_url}/v1/chat/completions",

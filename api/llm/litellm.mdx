@@ -25,28 +25,6 @@ Importing `litellm` takes approximately 2 seconds and pulls a large dependency t
   A bare model name without a prefix (e.g. `"gpt-5-mini"`) also works; LiteLLM infers the provider. The prefix is recommended for clarity and to avoid ambiguity when multiple providers serve the same base name.
 </ParamField>
 
-<ParamField path="api_base" type="str | None" default="None">
-  Override the API endpoint URL. Used to point `LiteLLM` at a local or self-hosted OpenAI-compatible server such as Ollama, vLLM, LM Studio, or llama.cpp. When `None`, LiteLLM uses the provider's default endpoint.
-</ParamField>
-
-<ParamField path="api_key" type="str | None" default="None">
-  Explicit API key to pass to LiteLLM. When `None`, JAZ first checks the provider's standard environment variable (e.g. `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) and then the credential stored in `~/.jaz/credentials.json`. An explicit `api_key` here takes highest precedence and overrides both.
-
-  For local servers using the `openai/` route prefix, the OpenAI route requires a non-empty key even when no real authentication is needed — any non-empty string (e.g. `"dummy"`) satisfies it.
-</ParamField>
-
-<ParamField path="temperature" type="float | None" default="None">
-  Sampling temperature passed through to the model on every call. A per-request default: settable at construction and applied uniformly unless a specific call overrides it. `None` leaves the provider's own default in effect.
-</ParamField>
-
-<ParamField path="max_tokens" type="int | None" default="None">
-  Maximum number of tokens to generate per call. Applied as a per-request default. `None` lets the provider apply its own limit.
-</ParamField>
-
-<ParamField path="reasoning_effort" type="str | None" default="None">
-  Reasoning effort level for models that support it (e.g. OpenAI o-series). Accepted values depend on the provider. `None` leaves the provider default in effect.
-</ParamField>
-
 <ParamField path="max_retries" type="int" default="10">
   Number of **extra** retries after the first failed call (LLM-SDK convention: `max_retries=2` means up to 3 total calls; `0` disables retry). Inherited from `BaseLLM`. Default is 10 to provide resilience during long autonomous agent runs.
 
@@ -74,7 +52,16 @@ Importing `litellm` takes approximately 2 seconds and pulls a large dependency t
 </ParamField>
 
 <ParamField path="**request_defaults" type="Any">
-  Any additional keyword arguments (e.g. `top_p`, `stop`, `seed`, `response_format`) are stored as per-request defaults and merged into every `litellm.completion` call. JAZ warns at construction time if a kwarg closely resembles a known parameter name but is not recognized — a likely typo guard.
+  Any additional keyword arguments are stored as per-request defaults and merged into every `litellm.completion` call. This is how all model parameters and routing options are passed — there are no separately named parameters beyond those listed above. Common examples:
+
+  - `api_base` (`str`) — override the API endpoint URL; use this to point `LiteLLM` at a local or self-hosted OpenAI-compatible server such as Ollama, vLLM, LM Studio, or llama.cpp.
+  - `api_key` (`str`) — explicit API key. JAZ resolves credentials in priority order: this value → provider environment variable (e.g. `OPENAI_API_KEY`) → `~/.jaz/credentials.json`. For local servers using the `openai/` route, pass any non-empty string (e.g. `"dummy"`) when no real auth is needed.
+  - `temperature` (`float`) — sampling temperature applied to every call.
+  - `max_tokens` (`int`) — maximum output tokens per call.
+  - `reasoning_effort` (`str`) — reasoning effort level for models that support it (e.g. OpenAI o-series).
+  - `top_p`, `stop`, `seed`, `response_format`, and any other LiteLLM-recognized parameter.
+
+  JAZ warns at construction time if a kwarg closely resembles a known parameter name but is not recognized — a likely typo guard.
 </ParamField>
 
 ## Supported providers

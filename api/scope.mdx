@@ -1,7 +1,7 @@
 ---
-title: "jaz.scope() — Ambient Inputs for Nested Invokes"
+title: "jaz.scope() — Propagate Ambient Inputs to Sub-Invokes"
 sidebarTitle: "scope()"
-description: "Bind values as ambient inputs for all enclosed jaz.invoke calls including nested ones, with inner-shadow semantics, conflict detection, and thread-safe snapshot propagation."
+description: "Bind values as ambient inputs for all enclosed jaz.invoke calls and nested sub-invokes, with inner-shadow semantics and conflict detection."
 ---
 
 `jaz.scope()` is a context manager that binds one or more values as **ambient inputs** — automatically available to every `jaz.invoke` call inside the block, and to every recursive sub-invoke below them, without threading the values through each intermediate call by hand. It is the solution to the manual-threading problem: a value that should live across many levels of nested invokes otherwise has to be re-passed at every layer, and a single forgotten kwarg silently drops it for the rest of the subtree.

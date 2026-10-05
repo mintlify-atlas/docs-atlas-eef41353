@@ -22,7 +22,7 @@ jaz.configure(llm=LiteLLM(model="openai/gpt-5-mini"))
 
 Use LiteLLM's `provider/model-id` routing format:
 
-```
+```text
 openai/gpt-5-mini
 openai/gpt-5
 anthropic/claude-opus-4-5
@@ -50,8 +50,8 @@ jaz.configure(
 
 The base `BaseLLM` wraps every completion call with configurable retry logic:
 
-<ParamField path="max_retries" type="int" default="3">
-  Maximum number of retry attempts on transient failures (rate limits, server errors).
+<ParamField path="max_retries" type="int" default="10">
+  Extra retry attempts after the first call on transient failures (rate limits, server errors). `max_retries=10` means up to 11 total calls; `0` disables retry entirely.
 </ParamField>
 <ParamField path="retry_wait_multiplier" type="float" default="1">
   Exponential backoff multiplier between retry attempts.
@@ -59,7 +59,7 @@ The base `BaseLLM` wraps every completion call with configurable retry logic:
 <ParamField path="retry_wait_min" type="float" default="4">
   Minimum wait time in seconds between retries.
 </ParamField>
-<ParamField path="retry_wait_max" type="float" default="10">
+<ParamField path="retry_wait_max" type="float" default="60">
   Maximum wait time in seconds between retries.
 </ParamField>
 
@@ -175,8 +175,8 @@ class MyLLM(BaseLLM):
         # ... call self.base_url; raise jaz.llm.RateLimitError / AuthenticationError / ...
         # on API errors so retry classification works.
         response = CompletionResponse(
-            choices=[Choice(message=Message("assistant", "..."))],
-            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            choices=[Choice(message=Message(role="assistant", content="..."))],
+            usage=Usage(prompt_tokens=1, completion_tokens=1),
             model=model,
         )
         return self.finalize(response, model)  # token accounting + cost, for free

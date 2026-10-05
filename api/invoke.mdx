@@ -1,7 +1,7 @@
 ---
-title: "invoke() and ainvoke() — Run a JAZ Agent"
+title: "invoke() and ainvoke() — Run a JAZ Agent Synchronously"
 sidebarTitle: "invoke()"
-description: "Run a REPL-based JAZ agent synchronously or asynchronously. Supports return type narrowing via ReturnType, local hooks, and a ConfigOverride in the same positional channel."
+description: "Run a REPL-based JAZ agent synchronously or asynchronously with return type narrowing via ReturnType, local hooks, and a positional ConfigOverride."
 ---
 
 The two entry points into the JAZ agent loop are `invoke` and `ainvoke`. Every keyword argument you pass becomes both a variable bound in the agent's Python REPL and a named item rendered in the agent's prompt header. Positional arguments are reserved for hooks (such as `jaz.hooks.ReturnType`) and an optional `ConfigOverride`; the prompt itself is just another keyword input.
@@ -27,6 +27,15 @@ def invoke(
 `ainvoke` carries the identical signature and semantics, but is a coroutine:
 
 ```python
+# Overload 1 — static return type narrowing
+async def ainvoke[ReturnT](
+    return_type: ReturnType[ReturnT],
+    /,
+    *local_config_hooks: Hook | ConfigOverride,
+    **inputs: object,
+) -> ReturnT: ...
+
+# Overload 2 — no return type contract
 async def ainvoke(
     *local_config_hooks: Hook | ConfigOverride,
     **inputs: object,
@@ -171,8 +180,10 @@ asyncio.run(main())
 
   ```python
   invoke("Calculate the factorial of 10")
-  # TypeError: invoke() got the prompt as a positional argument (str).
-  # The prompt is an input, passed by keyword, e.g., invoke(task='Calculate the factorial of 10').
+  # TypeError: invoke() got the prompt as a positional argument (str). The prompt is an
+  # input, passed by keyword, e.g., invoke(task='Calculate the factorial of 10').
+  # invoke()'s positional arguments are hooks and an optional ConfigOverride; every
+  # input — the prompt, data, tools — is a keyword argument.
   ```
 </Accordion>
 
@@ -195,8 +206,12 @@ asyncio.run(main())
   from jaz.config import ConfigOverrideByDepth
 
   invoke(ConfigOverrideByDepth({2: {"repl": ...}}), task="...")
-  # TypeError: invoke() got a ConfigOverrideByDepth positional argument.
-  # Use a propagating `with jaz.ConfigOverrideByDepth(...):` block instead.
+  # TypeError: invoke() got a ConfigOverrideByDepth positional argument. A per-depth
+  # override only makes sense when it propagates to sub-invokes at other depths; passed
+  # locally to one invoke, only that invoke's own depth would apply — a degenerate
+  # depth-gated plain override. Use a propagating
+  # `with jaz.ConfigOverrideByDepth(...):` block instead, or pass a plain
+  # `ConfigOverride(...)` positionally.
   ```
 </Accordion>
 

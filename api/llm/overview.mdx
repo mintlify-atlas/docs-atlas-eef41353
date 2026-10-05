@@ -65,7 +65,7 @@ jaz.configure(llm=AnthropicLLM(model="claude-opus-4-5"))  # not covered by stabl
 When a backend completes a call, it returns an `LLMResponse` (the normalized result JAZ works with internally). The underlying wire-level types — which you assemble when building a custom backend — live in `jaz.llm`:
 
 <ResponseField name="CompletionResponse" type="dataclass">
-  Provider-agnostic representation of a completion call's raw output. Holds a list of `Choice` objects, an optional `Usage`, the model string, and a response `id`.
+  Provider-agnostic representation of a completion call's raw output. Holds a list of `Choice` objects, an optional `Usage`, the model string, a response `id`, and an optional `tokens` field (`TurnRecord | None`) for token-native backends.
 </ResponseField>
 
 <ResponseField name="Usage" type="dataclass">

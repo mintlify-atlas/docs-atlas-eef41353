@@ -60,7 +60,7 @@ All events inherit from `jaz.hooks.base.Event`. Every event carries these fields
 
 Each span follows the same value-state pipeline. Events mark **when a value becomes fixed**, not phases of machinery:
 
-```
+```text
 proposal ──[edits]──▶ committed input ──[work or supply]──▶ raw result ──[modify]──▶ outcome
 
 *Enter    observes the proposal           controls edits + Abort     fires always

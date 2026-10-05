@@ -26,7 +26,7 @@ The console recognizes five special forms. Anything else is passed to the Python
 
 Ask the agent a question or give it a task. The result is printed and bound to `_`.
 
-```
+```text
 > what is 2 + 2?
 > summarize this paper: {paper_text}
 ```
@@ -39,7 +39,7 @@ Variables from the Python namespace are interpolated with `{var}`. Literal brace
 
 Ask the agent and bind the return value to a variable, optionally enforcing a type:
 
-```
+```text
 n: int <- how many days in a leap year?
 names: list <- give me five common first names
 result <- find the maximum of {values}
@@ -53,7 +53,7 @@ result <- find the maximum of {values}
 
 Print the JAZ description of any expression. For callable values the signature and docstring are shown; for described values the `jaz.describe` description is shown.
 
-```
+```text
 ?n
 ?my_function
 ?invoke
@@ -65,7 +65,7 @@ Print the JAZ description of any expression. For callable values the signature a
 
 Ask a sandboxed helper agent to change settings, answer questions about JAZ, or run jaz-related Python with confirmation:
 
-```
+```text
 % switch to gpt-5-mini
 % what model am I using?
 % show me how to add a BudgetPool
@@ -89,7 +89,7 @@ math.sqrt(2)
 
 ## Session example
 
-```
+```text
 > what is 2 + 2?
 n: int <- how many days in a leap year?
 ?n
@@ -130,13 +130,18 @@ Flags configure a single session without touching `~/.jaz/settings.json`:
 |------|-------------|
 | `--backend <name>` | Use a specific backend (`litellm`, `copilot`) |
 | `--model <id>` | Use a specific model ID |
-| `--max-cost <usd>` | Hard stop once the session has spent this many USD |
-| `--log <file>` | Write all events to a log file |
-| `-c "<prompt>"` | Run a single prompt and exit |
+| `--max-cost <usd>` | Hard stop once the session has spent this many USD (`BudgetPool`) |
+| `--max-calls <n>` | Hard stop once the session has made this many LLM calls (`BudgetPool`). Useful for models without pricing data. |
+| `--max-recursion <n>` | Cap nested `jaz.invoke` recursion depth (`RecursionLimit`) |
+| `--trace` | Enable Jaeger tracing (requires the `tracing` extra and a running Jaeger collector) |
+| `--log <file>` | Write all events to a log file (`FileLogger`) |
+| `--no-progress` | Disable the live progress display (spinner and code reveal) during invokes |
+| `-c "<prompt>"` | Run a single prompt and exit (one-shot mode) |
 
 ```bash
 jaz --backend copilot --model gpt-5-mini
-jaz --max-cost 0.50 --log session.log
+jaz --max-cost 0.50 --max-calls 50 --log session.log
+jaz --max-recursion 3 --trace
 jaz -c "what is the capital of France?"
 ```
 
@@ -174,7 +179,7 @@ set_credential("openai")
 
 The `>` and `<-` sigils share a conversation history across turns. Each turn passes the previous turns' prompts and results to the agent as `conversation_history`, so you can refer to earlier results naturally:
 
-```
+```text
 > load the CSV at data.csv
 > what are the column names?
 > plot the distribution of {_['age']}

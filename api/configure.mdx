@@ -1,7 +1,7 @@
 ---
-title: "jaz.configure() and ConfigOverride — Global and Scoped Config"
+title: "jaz.configure() and ConfigOverride — JAZ Config API"
 sidebarTitle: "configure()"
-description: "Set process-wide JAZ defaults with configure(), scope them per-invoke with ConfigOverride, apply per-depth overrides with ConfigOverrideByDepth, and read the active config with get_config()."
+description: "Set process-wide defaults with configure(), scope overrides with ConfigOverride, apply per-depth rules with ConfigOverrideByDepth, and read config."
 ---
 
 JAZ configuration is grouped into three **component groups**: `llm`, `repl`, and `protocol`. Each group holds a fully-constructed component object — a `BaseLLM`, a `BaseREPL`, or a `BaseProtocol` — and setting a group replaces it entirely. There is no partial update of a single setting within a group; you restate the component with the constructor arguments you want.
@@ -133,7 +133,15 @@ A single `ConfigOverride` instance may be active in **at most one `with` scope a
 
 ## `ConfigOverrideByDepth`
 
-`ConfigOverrideByDepth` applies per-recursion-depth config overrides. It accepts a mapping of absolute recursion depth (the top invoke is depth 1) to a partial config.
+`ConfigOverrideByDepth` applies per-recursion-depth config overrides. It accepts a single positional argument — a mapping of absolute recursion depth (the top invoke is depth 1) to a partial config dict. It is a subclass of `ConfigOverride` and must be used as a context manager.
+
+```python
+class ConfigOverrideByDepth(ConfigOverride):
+    def __init__(
+        self,
+        overrides_by_depth: dict[int, dict[str, Any]] | None,
+    ) -> None: ...
+```
 
 ```python
 from jaz.config import ConfigOverrideByDepth

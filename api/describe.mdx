@@ -1,7 +1,7 @@
 ---
 title: "jaz.describe() — Attach Prompt Descriptions to Values"
 sidebarTitle: "describe()"
-description: "Attach a permanent description to any value so it renders meaningfully in the agent's prompt header when passed as an invoke input, with three storage strategies and scoped DescriptionOverride."
+description: "Attach a permanent prompt description to any value using three storage strategies, and scope temporary overrides per block with DescriptionOverride."
 ---
 
 When a value is passed as a keyword input to `jaz.invoke`, JAZ renders it in the agent's prompt header. By default it uses the value's `str()` representation, or a synthesised signature-and-docstring block for callables and classes. `jaz.describe()` lets you replace that default with a custom description — attached permanently to the object itself, so it travels with the value into any nested `jaz.invoke` call without any extra wiring.

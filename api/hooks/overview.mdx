@@ -132,7 +132,7 @@ For cross-cutting observers — loggers, tracers, replay — that treat every ev
 
 ```python
 from jaz.hooks import Hook
-from jaz.hooks.base import Event
+from jaz.hooks.events import Event
 from jaz.hooks.effects import Effect
 
 class MyLogger(Hook):
@@ -202,8 +202,7 @@ Every event carries a `blackboard` — a generationally-versioned key-value stor
 ```python
 from jaz.hooks import Hook
 from jaz.hooks.effects import BlackboardWrite, Effect
-from jaz.hooks.events import LLMQueryEnter, LLMQueryExit
-from jaz.hooks.events.base import Completed
+from jaz.hooks.events import LLMQueryEnter, LLMQueryExit, Completed
 
 class CostTracker(Hook):
     def on_llm_query_exit(self, event: LLMQueryExit) -> list[Effect]:

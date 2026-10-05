@@ -1,5 +1,5 @@
 ---
-title: "How the JAZ Agent Loop Works"
+title: "How the JAZ Agent Loop Works: LLM, REPL, and Return"
 sidebarTitle: "Agent Loop"
 description: "Understand how JAZ orchestrates an LLM and a Python REPL in a turn-by-turn loop, from the first invoke call to the final return value."
 ---
@@ -53,7 +53,12 @@ Every `invoke()` call is assigned a UUID (`invoke_id`) and an integer `depth`. T
 |---|---|---|
 | `invoke_id` | `str` (UUID) | Unique identifier for this invoke |
 | `depth` | `int` | Absolute recursion depth; the top invoke is `1` |
-| `parent_invoke_id` | `str \| None` | UUID of the enclosing invoke, or `None` at the root |
+| `config` | `Config` | The depth-resolved effective config for this invoke |
+| `blackboard` | `Blackboard` | Per-invoke key/value store for cross-hook coordination |
+| `hooks` | `tuple[Hook, ...]` | The active hook set at the moment this event was dispatched |
+| `timestamp` | `datetime` | UTC datetime when the event was emitted |
+
+`InvokeEnter` additionally carries `parent_invoke_id: str | None` (the enclosing invoke's UUID, or `None` at the root) and `parent_repl_iteration: int | None` (which REPL turn spawned this child invoke).
 </Accordion>
 
 These fields appear on every event fired by the hook system (`event.invoke_id`, `event.depth`), so hooks can correlate events across the whole invocation tree without any extra bookkeeping.
